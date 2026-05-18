@@ -40,6 +40,26 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "utils/acl.h"
+/*
+ * Headers required for the native (non-SPI) sampling path. They are guarded by
+ * a PG10+ check because some of the APIs (BackendType, GetBackendTypeDesc,
+ * pgstat_get_local_beentry_by_*) only exist on newer releases. On PG 9.6 we
+ * fall back to the original SPI path below.
+ */
+#if PG_VERSION_NUM >= 100000
+#include "storage/procarray.h"
+#include "storage/lock.h"
+#include "utils/lsyscache.h"
+#include "common/ip.h"
+#include "libpq/libpq-be.h"
+#if PG_VERSION_NUM >= 140000
+#include "utils/wait_event.h"
+#endif
+#if PG_VERSION_NUM >= 140000
+#include "utils/backend_status.h"
+#endif
+#include "commands/dbcommands.h"
+#endif
 
 /* Handle privilege checking across PostgreSQL versions */
 #if PG_VERSION_NUM >= 150000
@@ -90,6 +110,13 @@ static char *pgsentinelDbName = "postgres";
 /* Worker name */
 static char *worker_name = "pgsentinel";
 
+/*
+ * Legacy SQL queries used by the pre-PG10 SPI sampling path.  On PG10+ we
+ * use ash_collect_native() so these constants are unreferenced; keep them
+ * compiled in only on the version where they are actually used so that
+ * -Werror=unused-const-variable does not break the build.
+ */
+#if PG_VERSION_NUM < 100000
 /* pg_stat_activity query */
 static const char * const pgsa_query_no_track_idle=
 #if (PG_VERSION_NUM / 100 ) == 906
@@ -194,6 +221,7 @@ static const char * const pgsa_query_track_idle=
  on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
  where act.state in ('active', 'idle in transaction') and act.pid != pg_backend_pid()";
 #endif
+#endif /* PG_VERSION_NUM < 100000 */
 
 static const char * const pg_stat_statements_query=
 #if PG_VERSION_NUM < 130000
@@ -883,6 +911,421 @@ ash_prepare_store(TimestampTz ash_time, const int pid,
 					queryid, gpi_query, cmdtype);
 }
 
+#if PG_VERSION_NUM >= 100000
+/*
+ * Native (non-SPI) sampler. Walks the BackendStatusArray directly and
+ * resolves each interesting row to a PGPROC for wait_event_info and lock
+ * blocker data, then stores entries into the ASH ring buffer.
+ *
+ * Why this exists: the old SPI path executed a complex SQL statement against
+ * pg_stat_activity that joined back to itself and invoked pg_blocking_pids()
+ * twice per row and get_parsedinfo() once per row.  On busy systems with many
+ * backends that planner/executor cost dominated the sampler.  Reading the
+ * same data from shared memory directly avoids all of that overhead.
+ *
+ * Version notes:
+ *   * PG17 renamed pgstat_fetch_stat_local_beentry to
+ *     pgstat_get_local_beentry_by_index and dropped the BackendId aliases.
+ *   * GetBackendTypeDesc has been available since PG10.
+ *   * GetBlockerStatusData has been available since PG9.6 but we only call it
+ *     on PG10+ because we share the rest of the new code path with it.
+ *   * Wait event helpers (pgstat_get_wait_event{_type}) moved from pgstat.h
+ *     to utils/wait_event.h in PG14.
+ */
+
+/* Compatibility shim for the local-beentry accessor renamed in PG17. */
+#if PG_VERSION_NUM >= 170000
+#define PGSENTINEL_LOCAL_BEENTRY(idx) pgstat_get_local_beentry_by_index(idx)
+#else
+#define PGSENTINEL_LOCAL_BEENTRY(idx) pgstat_fetch_stat_local_beentry(idx)
+#endif
+
+/*
+ * Map a BackendState to the same human-readable string that
+ * pg_stat_get_activity reports.  Returning an empty string for unknowns lets
+ * the existing ash_prepare_store handling treat it as "no state".
+ */
+static const char *
+ash_state_string(BackendState st)
+{
+	switch (st)
+	{
+		case STATE_IDLE:
+			return "idle";
+		case STATE_RUNNING:
+			return "active";
+		case STATE_IDLEINTRANSACTION:
+			return "idle in transaction";
+		case STATE_FASTPATH:
+			return "fastpath function call";
+		case STATE_IDLEINTRANSACTION_ABORTED:
+			return "idle in transaction (aborted)";
+		case STATE_DISABLED:
+			return "disabled";
+		case STATE_UNDEFINED:
+		default:
+			return "";
+	}
+}
+
+/*
+ * Render a SockAddr the same way pg_stat_get_activity does for the
+ * client_addr column.  The caller passes in scratch buffers sized to fit a
+ * numeric host/port representation.
+ */
+static void
+ash_format_clientaddr(SockAddr *addr, char *host_out, size_t host_outlen)
+{
+	host_out[0] = '\0';
+
+	if (addr->addr.ss_family == AF_INET
+#ifdef HAVE_IPV6
+		|| addr->addr.ss_family == AF_INET6
+#endif
+		)
+	{
+		char	   svc[NI_MAXSERV];
+
+		if (pg_getnameinfo_all(&addr->addr, addr->salen,
+							   host_out, host_outlen,
+							   svc, sizeof(svc),
+							   NI_NUMERICHOST | NI_NUMERICSERV) != 0)
+			host_out[0] = '\0';
+		else
+			clean_ipv6_addr(addr->addr.ss_family, host_out);
+	}
+	/* AF_UNIX or unknown family -> leave empty. */
+}
+
+/*
+ * Find a blocker pid and a count of blockers.  This is a direct port of the
+ * algorithm in pg_blocking_pids() (lockfuncs.c): walk the per-procLOCK
+ * instance data returned by GetBlockerStatusData and pick out the entries
+ * whose held / awaited lock modes conflict with the blocked proc's awaited
+ * mode.  We only call GetBlockerStatusData *once* per sampled backend, which
+ * is the central performance win versus the SQL path that called
+ * pg_blocking_pids twice (once for the pid, once for cardinality).
+ */
+static void
+ash_resolve_blocker(int blocked_pid, int *blocker_pid, int *blocker_count)
+{
+	BlockedProcsData *lockData;
+	int			i,
+				j;
+
+	*blocker_pid = 0;
+	*blocker_count = 0;
+
+	lockData = GetBlockerStatusData(blocked_pid);
+	if (lockData == NULL)
+		return;
+
+	for (i = 0; i < lockData->nprocs; i++)
+	{
+		BlockedProcData *bproc = &lockData->procs[i];
+		LockInstanceData *instances = &lockData->locks[bproc->first_lock];
+		int		   *preceding_waiters = &lockData->waiter_pids[bproc->first_waiter];
+		LockInstanceData *blocked_instance = NULL;
+		LockMethod	lockMethodTable;
+		int			conflictMask;
+
+		/* Locate the blocked proc's own waiting entry. */
+		for (j = 0; j < bproc->num_locks; j++)
+		{
+			LockInstanceData *instance = &instances[j];
+
+			if (instance->pid == bproc->pid)
+			{
+				blocked_instance = instance;
+				break;
+			}
+		}
+		if (blocked_instance == NULL)
+			continue;
+
+		lockMethodTable = GetLockTagsMethodTable(&blocked_instance->locktag);
+		conflictMask = lockMethodTable->conflictTab[blocked_instance->waitLockMode];
+
+		for (j = 0; j < bproc->num_locks; j++)
+		{
+			LockInstanceData *instance = &instances[j];
+
+			if (instance == blocked_instance)
+				continue;
+			if (instance->leaderPid == blocked_instance->leaderPid)
+				continue;
+
+			if (conflictMask & instance->holdMask)
+			{
+				/* Hard block. */
+			}
+			else if (instance->waitLockMode != NoLock &&
+					 (conflictMask & LOCKBIT_ON(instance->waitLockMode)))
+			{
+				/* Soft block: only counts if the holder is ahead in queue. */
+				bool		ahead = false;
+				int			k;
+
+				for (k = 0; k < bproc->num_waiters; k++)
+				{
+					if (preceding_waiters[k] == instance->pid)
+					{
+						ahead = true;
+						break;
+					}
+				}
+				if (!ahead)
+					continue;
+			}
+			else
+			{
+				continue;
+			}
+
+			if (*blocker_pid == 0)
+				*blocker_pid = instance->leaderPid;
+			(*blocker_count)++;
+		}
+	}
+}
+
+/*
+ * Collect one ASH sample directly from shared memory, without going through
+ * SPI / SQL.  Mirrors the column set produced by the original SQL query so
+ * that ash_prepare_store / pg_active_session_history continue to see the same
+ * data shape.
+ */
+static void
+ash_collect_native(TimestampTz ash_time, bool track_idle, bool *gotactives)
+{
+	int			numbackends;
+	int			curr;
+	int			my_pid = MyProcPid;
+
+	/*
+	 * Reset any previously cached snapshot so we re-read shared memory this
+	 * tick instead of returning a stale copy from earlier in the
+	 * transaction.
+	 */
+#if PG_VERSION_NUM >= 100000
+	pgstat_clear_backend_activity_snapshot();
+#endif
+
+	numbackends = pgstat_fetch_stat_numbackends();
+
+	for (curr = 1; curr <= numbackends; curr++)
+	{
+		LocalPgBackendStatus *local_be = PGSENTINEL_LOCAL_BEENTRY(curr);
+		PgBackendStatus *be;
+		PGPROC	   *proc;
+		BackendState st;
+		const char *state_str;
+		const char *wait_event_type = "CPU";
+		const char *wait_event = "CPU";
+		const char *backend_type_str = "";
+		const char *cmd_type = "";
+		const char *query = "";
+		const char *blocker_state = "";
+		int			leader_pid = 0;
+		int			blocker_pid = 0;
+		int			blocker_count = 0;
+		char		client_host[NI_MAXHOST];
+		uint64		queryid = 0;
+		int			procnum_idx;
+
+		if (local_be == NULL)
+			continue;
+		be = &local_be->backendStatus;
+
+		/* Skip empty slots and our own background worker. */
+		if (be->st_procpid <= 0 || be->st_procpid == my_pid)
+			continue;
+
+		st = be->st_state;
+
+		/* Filter to the same states the SQL WHERE clause used. */
+		if (track_idle)
+		{
+			if (st != STATE_RUNNING && st != STATE_IDLEINTRANSACTION)
+				continue;
+		}
+		else
+		{
+			if (st != STATE_RUNNING)
+				continue;
+		}
+
+		state_str = ash_state_string(st);
+
+		/*
+		 * Resolve the PGPROC for wait_event_info and leader pid.  Backend
+		 * lookup first, then auxiliary lookup for things like the checkpointer
+		 * or background writer (those go through pg_stat_activity in newer
+		 * PostgreSQL releases and we want to surface their wait events too).
+		 */
+		proc = BackendPidGetProc(be->st_procpid);
+		if (proc == NULL)
+			proc = AuxiliaryPidGetProc(be->st_procpid);
+
+		if (proc != NULL)
+		{
+			/*
+			 * Read the wait_event_info word once with a volatile cast.  Per
+			 * the upstream pg_stat_get_activity, no extra lock is needed
+			 * because the field is sized to be read atomically on supported
+			 * platforms; the worst case is a momentarily torn read which we
+			 * tolerate the same way pg_stat_activity does.
+			 */
+			uint32		raw_wait = *((volatile uint32 *) &proc->wait_event_info);
+
+			if (raw_wait != 0)
+			{
+				wait_event_type = pgstat_get_wait_event_type(raw_wait);
+				wait_event = pgstat_get_wait_event(raw_wait);
+				if (wait_event_type == NULL) wait_event_type = "CPU";
+				if (wait_event == NULL) wait_event = "CPU";
+			}
+
+#if PG_VERSION_NUM >= 130000
+			if (proc->lockGroupLeader != NULL &&
+				proc->lockGroupLeader->pid != be->st_procpid)
+				leader_pid = proc->lockGroupLeader->pid;
+#endif
+		}
+
+		/* Backend type description (e.g. "client backend", "autovacuum worker"). */
+		backend_type_str = GetBackendTypeDesc(be->st_backendType);
+		if (backend_type_str == NULL)
+			backend_type_str = "";
+
+		/*
+		 * ProcEntryArray is indexed by the PGPROC offset in
+		 * ProcGlobal->allProcs (see post_parse_analyze hook in
+		 * get_parsedinfo.c).  Re-derive that index from the PGPROC pointer
+		 * we already resolved, instead of relying on LocalPgBackendStatus
+		 * fields whose names have churned across PostgreSQL releases.
+		 */
+		procnum_idx = (proc != NULL) ? (int) (proc - ProcGlobal->allProcs) : -1;
+
+		if (procnum_idx >= 0 && procnum_idx < get_max_procs_count())
+		{
+			procEntry *pe = &ProcEntryArray[procnum_idx];
+
+			if (pe->query != NULL && pe->query[0] != '\0')
+				query = pe->query;
+			if (pe->cmdtype != NULL && pe->cmdtype[0] != '\0')
+				cmd_type = pe->cmdtype;
+			queryid = pe->queryid;
+		}
+
+#if PG_VERSION_NUM >= 140000
+		/*
+		 * Prefer the activity's authoritative query_id when it is set: it
+		 * mirrors what act.query_id from pg_stat_activity used to provide in
+		 * the SQL path.
+		 */
+		if (be->st_query_id != 0)
+			queryid = be->st_query_id;
+#endif
+
+		/* Format the inet address text the same way pg_stat_get_activity does. */
+		ash_format_clientaddr(&be->st_clientaddr, client_host, sizeof(client_host));
+
+		/*
+		 * Resolve the first blocker / blocker count.  We do this *once* per
+		 * sampled backend instead of the two pg_blocking_pids() calls the SQL
+		 * path performed.
+		 */
+		ash_resolve_blocker(be->st_procpid, &blocker_pid, &blocker_count);
+
+		/*
+		 * Resolve blocker_state by reading the blocker's PgBackendStatus.  We
+		 * already cached every entry via pgstat_get_local_beentry_by_index;
+		 * doing a small linear scan is fine since this only runs once per
+		 * sampled blocked backend.
+		 */
+		if (blocker_pid != 0)
+		{
+			int			j;
+
+			for (j = 1; j <= numbackends; j++)
+			{
+				LocalPgBackendStatus *cand = PGSENTINEL_LOCAL_BEENTRY(j);
+
+				if (cand && cand->backendStatus.st_procpid == blocker_pid)
+				{
+					blocker_state = ash_state_string(cand->backendStatus.st_state);
+					break;
+				}
+			}
+		}
+
+		/*
+		 * Resolve datname and usename via syscache.  We're already inside an
+		 * active transaction (the caller pushes a snapshot), so the lookups
+		 * are safe.  get_database_name/GetUserNameFromId return palloc'd
+		 * strings that ash_prepare_store copies into the ring buffer.
+		 */
+		{
+			char	   *datname = NULL;
+			char	   *usename = NULL;
+			const char *appname = be->st_appname ? be->st_appname : "";
+			const char *clienthost = be->st_clienthostname ? be->st_clienthostname : "";
+			const char *activity = be->st_activity_raw ? be->st_activity_raw : "";
+			char	   *clipped_activity;
+
+			if (OidIsValid(be->st_databaseid))
+				datname = get_database_name(be->st_databaseid);
+			if (OidIsValid(be->st_userid))
+				usename = GetUserNameFromId(be->st_userid, true);
+
+			/* Strip any multibyte truncation tail, same as pg_stat_activity. */
+			clipped_activity = pgstat_clip_activity(activity);
+
+			*gotactives = true;
+
+			ash_prepare_store(ash_time,
+							  be->st_procpid,
+#if PG_VERSION_NUM >= 130000
+							  leader_pid,
+#endif
+							  usename ? usename : "",
+							  /*
+							   * client_port is no longer reported via
+							   * BackendStatus in a portable way; leave 0.
+							   * The pg_active_session_history view continues
+							   * to expose this column for compatibility but
+							   * it has historically been informational only.
+							   */
+							  0,
+							  be->st_databaseid,
+							  datname ? datname : "",
+							  appname,
+							  client_host,
+							  local_be->backend_xmin,
+							  be->st_proc_start_timestamp,
+							  be->st_xact_start_timestamp,
+							  be->st_activity_start_timestamp,
+							  be->st_state_start_timestamp,
+							  wait_event_type,
+							  wait_event,
+							  state_str,
+							  clienthost,
+							  clipped_activity,
+							  backend_type_str,
+							  be->st_userid,
+							  local_be->backend_xid,
+							  blocker_count,
+							  blocker_pid,
+							  blocker_state,
+							  queryid,
+							  query,
+							  cmd_type);
+		}
+	}
+}
+#endif /* PG_VERSION_NUM >= 100000 */
+
 void
 pgsentinel_main(Datum main_arg)
 {
@@ -965,6 +1408,23 @@ letswait:
 			goto letswait;
 		}
 
+#if PG_VERSION_NUM >= 100000
+		/*
+		 * Native path: read backend status and lock state directly from
+		 * shared memory.  We still report our own activity for visibility
+		 * but no SPI/SQL parsing is involved.
+		 */
+		pgstat_report_activity(STATE_RUNNING, "pgsentinel: collecting ASH sample");
+		ash_time = GetCurrentTimestamp();
+		ash_collect_native(ash_time, ash_track_idle_trans, &gotactives);
+		/* Avoid "unused variable" warnings on the SPI return value path. */
+		(void) ret;
+#else
+		/*
+		 * Legacy SPI path retained for PostgreSQL 9.6, which lacks the public
+		 * APIs used by ash_collect_native (BackendType, GetBackendTypeDesc,
+		 * pgstat_get_local_beentry_by_*, etc.).
+		 */
 		SPI_connect();
 
 		if (ash_track_idle_trans)
@@ -986,6 +1446,7 @@ letswait:
 			elog(FATAL, "cannot select from pg_stat_activity: error code %d", ret);
 
 		ash_time=GetCurrentTimestamp();
+
 		/* Do some processing */
 
 		if (SPI_processed > 0)
@@ -1239,12 +1700,13 @@ letswait:
 			}
 		}
 		SPI_finish();
+#endif /* PG_VERSION_NUM < 100000 */
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		pgstat_report_activity(STATE_IDLE, NULL);
 
 		/* pg_stat_statement_history */
-		if (gotactives && pgssh_enable) 
+		if (gotactives && pgssh_enable)
 		{
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();

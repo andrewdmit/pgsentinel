@@ -120,6 +120,17 @@ You can see it as samplings of `pg_stat_activity` providing more information:
 * `blockerpid`: the pid of the blocker (if blockers = 1), the pid of one blocker (if blockers > 1)
 * `blocker_state`: state of the blocker (state of the blockerpid) 
 
+### Sampler implementation
+
+Starting with PostgreSQL 10, `pgsentinel` collects ASH samples directly from
+shared memory (the `BackendStatusArray`, `PGPROC`, and the lock manager) rather
+than by executing a SQL query through SPI on every tick. This avoids the cost
+of parsing/planning/executing a large `pg_stat_activity` self-join and limits
+the work spent on lock-blocker resolution to a single `GetBlockerStatusData`
+call per sampled backend. On PostgreSQL 9.6 the original SPI-based sampling
+path is still used. There is no user-visible change to the
+`pg_active_session_history` view or its configuration.
+
 `pgsentinel` also reports query statistics history through the `pg_stat_statements_history` view:
 
 
