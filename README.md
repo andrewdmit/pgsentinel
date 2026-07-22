@@ -120,6 +120,20 @@ You can see it as samplings of `pg_stat_activity` providing more information:
 * `blockerpid`: the pid of the blocker (if blockers = 1), the pid of one blocker (if blockers > 1)
 * `blocker_state`: state of the blocker (state of the blockerpid) 
 
+### Sampler implementation
+
+On every tick `pgsentinel` collects ASH samples by calling the built-in
+functions `pg_stat_get_activity()` and `pg_blocking_pids()` directly through
+the fmgr, rather than by executing a large `pg_stat_activity` self-join through
+SPI. This avoids the cost of parsing, planning and executing that query on each
+sample while still relying only on PostgreSQL's own documented functions: the
+extension consumes the rows `pg_stat_get_activity()` returns and the array of
+blocking pids `pg_blocking_pids()` returns, and builds the blocker resolution
+around those results instead of duplicating any core algorithm inside the
+extension. Blockers are resolved with a single `pg_blocking_pids()` call per
+sampled backend. There is no user-visible change to the
+`pg_active_session_history` view or its configuration.
+
 `pgsentinel` also reports query statistics history through the `pg_stat_statements_history` view:
 
 

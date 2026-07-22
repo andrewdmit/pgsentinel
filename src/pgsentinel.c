@@ -40,6 +40,24 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "utils/acl.h"
+/*
+ * Headers for the sampling path.  Rather than re-implementing the bodies of
+ * pg_stat_get_activity() and pg_blocking_pids() inside the extension (which
+ * would tie us to whatever BackendStatusArray / lock-manager layout the
+ * targeted PostgreSQL happens to have), we call those two functions directly
+ * through the fmgr and build the sampler logic around the values they return.
+ * These headers provide what that needs: fmgr OIDs, a standalone ExprContext
+ * to receive a set-returning function's tuplestore, tuple-slot access to read
+ * the returned rows, array deconstruction for pg_blocking_pids()'s int[]
+ * result, and the syscache lookups that turn datid/usesysid into names.
+ */
+#include "executor/executor.h"
+#include "executor/tuptable.h"
+#include "utils/tuplestore.h"
+#include "utils/array.h"
+#include "utils/fmgroids.h"
+#include "catalog/pg_type.h"
+#include "commands/dbcommands.h"
 
 /* Handle privilege checking across PostgreSQL versions */
 #if PG_VERSION_NUM >= 150000
@@ -90,110 +108,6 @@ static char *pgsentinelDbName = "postgres";
 /* Worker name */
 static char *worker_name = "pgsentinel";
 
-/* pg_stat_activity query */
-static const char * const pgsa_query_no_track_idle=
-#if (PG_VERSION_NUM / 100 ) == 906
-"select act.datid, act.datname, act.pid, act.usesysid, act.usename, \
- act.application_name, text(act.client_addr), act.client_hostname, \
- act.client_port, act.backend_start, act.xact_start, act.query_start, \
- act.state_change, case when act.wait_event_type is null then 'CPU'  \
- else act.wait_event_type end as wait_event_type,case when act.wait_event is null \
- then 'CPU' else act.wait_event end as wait_event, act.state, act.backend_xid, \
- act.backend_xmin, act.query,(pg_blocking_pids(act.pid))[1], \
- cardinality(pg_blocking_pids(act.pid)),blk.state,gpi.* \
- from pg_stat_activity act left join pg_stat_activity blk  \
- on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
- where act.state ='active' and act.pid != pg_backend_pid()";
-#elif PG_VERSION_NUM < 130000
-"select act.datid, act.datname, act.pid, act.usesysid, act.usename, \
- act.application_name, text(act.client_addr), act.client_hostname, \
- act.client_port, act.backend_start, act.xact_start, act.query_start,  \
- act.state_change, case when act.wait_event_type is null then 'CPU' \
- else act.wait_event_type end as wait_event_type,case when act.wait_event is null \
- then 'CPU' else act.wait_event end as wait_event, act.state, act.backend_xid, \
- act.backend_xmin, act.query, act.backend_type,(pg_blocking_pids(act.pid))[1], \
- cardinality(pg_blocking_pids(act.pid)),blk.state,gpi.* \
- from pg_stat_activity act left join pg_stat_activity blk  \
- on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
- where act.state ='active' and act.pid != pg_backend_pid()";
-#elif PG_VERSION_NUM < 160000
-"select act.datid, act.datname, act.pid, act.usesysid, act.usename, \
- act.application_name, text(act.client_addr), act.client_hostname, \
- act.client_port, act.backend_start, act.xact_start, act.query_start,  \
- act.state_change, case when act.wait_event_type is null then 'CPU' \
- else act.wait_event_type end as wait_event_type,case when act.wait_event is null \
- then 'CPU' else act.wait_event end as wait_event, act.state, act.backend_xid, \
- act.backend_xmin, act.query, act.backend_type,(pg_blocking_pids(act.pid))[1], \
- cardinality(pg_blocking_pids(act.pid)),blk.state,gpi.*, act.leader_pid \
- from pg_stat_activity act left join pg_stat_activity blk  \
- on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
- where act.state ='active' and act.pid != pg_backend_pid()";
-#else
-"select act.datid, act.datname, act.pid, act.usesysid, act.usename, \
- act.application_name, text(act.client_addr), act.client_hostname, \
- act.client_port, act.backend_start, act.xact_start, act.query_start,  \
- act.state_change, case when act.wait_event_type is null then 'CPU' \
- else act.wait_event_type end as wait_event_type,case when act.wait_event is null \
- then 'CPU' else act.wait_event end as wait_event, act.state, act.backend_xid, \
- act.backend_xmin, act.query, act.backend_type,(pg_blocking_pids(act.pid))[1], \
- cardinality(pg_blocking_pids(act.pid)),blk.state,gpi.pid,act.query_id, \
- gpi.query, gpi.cmdtype, act.leader_pid \
- from pg_stat_activity act left join pg_stat_activity blk  \
- on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
- where act.state ='active' and act.pid != pg_backend_pid()";
-#endif
-
-static const char * const pgsa_query_track_idle=
-#if (PG_VERSION_NUM / 100 ) == 906
-"select act.datid, act.datname, act.pid, act.usesysid, act.usename, \
- act.application_name, text(act.client_addr), act.client_hostname, \
- act.client_port, act.backend_start, act.xact_start, act.query_start, \
- act.state_change, case when act.wait_event_type is null then 'CPU'  \
- else act.wait_event_type end as wait_event_type,case when act.wait_event is null \
- then 'CPU' else act.wait_event end as wait_event, act.state, act.backend_xid, \
- act.backend_xmin, act.query,(pg_blocking_pids(act.pid))[1], \
- cardinality(pg_blocking_pids(act.pid)),blk.state,gpi.* \
- from pg_stat_activity act left join pg_stat_activity blk  \
- on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
- where act.state in ('active', 'idle in transaction') and act.pid != pg_backend_pid()";
-#elif PG_VERSION_NUM < 130000
-"select act.datid, act.datname, act.pid, act.usesysid, act.usename, \
- act.application_name, text(act.client_addr), act.client_hostname, \
- act.client_port, act.backend_start, act.xact_start, act.query_start,  \
- act.state_change, case when act.wait_event_type is null then 'CPU' \
- else act.wait_event_type end as wait_event_type,case when act.wait_event is null \
- then 'CPU' else act.wait_event end as wait_event, act.state, act.backend_xid, \
- act.backend_xmin, act.query, act.backend_type,(pg_blocking_pids(act.pid))[1], \
- cardinality(pg_blocking_pids(act.pid)),blk.state,gpi.* \
- from pg_stat_activity act left join pg_stat_activity blk  \
- on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
- where act.state in ('active', 'idle in transaction') and act.pid != pg_backend_pid()";
-#elif PG_VERSION_NUM < 160000
-"select act.datid, act.datname, act.pid, act.usesysid, act.usename, \
- act.application_name, text(act.client_addr), act.client_hostname, \
- act.client_port, act.backend_start, act.xact_start, act.query_start,  \
- act.state_change, case when act.wait_event_type is null then 'CPU' \
- else act.wait_event_type end as wait_event_type,case when act.wait_event is null \
- then 'CPU' else act.wait_event end as wait_event, act.state, act.backend_xid, \
- act.backend_xmin, act.query, act.backend_type,(pg_blocking_pids(act.pid))[1], \
- cardinality(pg_blocking_pids(act.pid)),blk.state,gpi.*, act.leader_pid \
- from pg_stat_activity act left join pg_stat_activity blk  \
- on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
- where act.state in ('active', 'idle in transaction') and act.pid != pg_backend_pid()";
-#else
-"select act.datid, act.datname, act.pid, act.usesysid, act.usename, \
- act.application_name, text(act.client_addr), act.client_hostname, \
- act.client_port, act.backend_start, act.xact_start, act.query_start,  \
- act.state_change, case when act.wait_event_type is null then 'CPU' \
- else act.wait_event_type end as wait_event_type,case when act.wait_event is null \
- then 'CPU' else act.wait_event end as wait_event, act.state, act.backend_xid, \
- act.backend_xmin, act.query, act.backend_type,(pg_blocking_pids(act.pid))[1], \
- cardinality(pg_blocking_pids(act.pid)),blk.state,gpi.pid,act.query_id, \
- gpi.query, gpi.cmdtype, act.leader_pid \
- from pg_stat_activity act left join pg_stat_activity blk  \
- on (pg_blocking_pids(act.pid))[1] = blk.pid,get_parsedinfo(act.pid) gpi \
- where act.state in ('active', 'idle in transaction') and act.pid != pg_backend_pid()";
-#endif
 
 static const char * const pg_stat_statements_query=
 #if PG_VERSION_NUM < 130000
@@ -883,6 +797,438 @@ ash_prepare_store(TimestampTz ash_time, const int pid,
 					queryid, gpi_query, cmdtype);
 }
 
+/*
+ * Sampling helpers.
+ *
+ * These functions never touch the BackendStatusArray or the lock manager's
+ * internal structures directly.  Instead they invoke pg_stat_get_activity()
+ * and pg_blocking_pids() through the fmgr and work with the values those
+ * functions return, so the sampler rides on documented, version-stable
+ * interfaces (the columns of pg_stat_activity and an int[] of blocking pids)
+ * rather than on a snapshot of core internals copied into the extension.
+ */
+
+/* One collected pg_stat_activity row, kept only for the duration of a tick. */
+typedef struct ashActivityRow
+{
+	int				pid;
+	int				leader_pid;
+	int				client_port;
+	Oid				datid;
+	Oid				usesysid;
+	TransactionId	backend_xid;
+	TransactionId	backend_xmin;
+	TimestampTz		backend_start;
+	TimestampTz		xact_start;
+	TimestampTz		query_start;
+	TimestampTz		state_change;
+	uint64			query_id;
+	char		   *application_name;
+	char		   *wait_event_type;
+	char		   *wait_event;
+	char		   *state;
+	char		   *client_hostname;
+	char		   *client_addr;
+	char		   *backend_type;
+	char		   *top_level_query;
+} ashActivityRow;
+
+/* Resolve a column of pg_stat_get_activity() by name; 0 when not present. */
+static int
+ash_activity_attno(TupleDesc tupdesc, const char *name)
+{
+	int			i;
+
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (!att->attisdropped && strcmp(NameStr(att->attname), name) == 0)
+			return att->attnum;
+	}
+	return 0;
+}
+
+/* Read a text column, returning def when the attribute is missing or NULL. */
+static char *
+ash_activity_text(TupleTableSlot *slot, int attno, char *def)
+{
+	bool		isnull;
+	Datum		value;
+
+	if (attno <= 0)
+		return def;
+	value = slot_getattr(slot, attno, &isnull);
+	if (isnull)
+		return def;
+	return TextDatumGetCString(value);
+}
+
+/*
+ * Ask PostgreSQL who blocks a pid by calling pg_blocking_pids() and inspecting
+ * the array it returns: the element count is the number of blockers and the
+ * first element is the pid we surface as "blockerpid".  All of the lock-table
+ * analysis stays inside pg_blocking_pids(); we only read its result.
+ */
+static void
+ash_get_blockers(int pid, int *blocker_pid, int *blocker_count)
+{
+	Datum		result;
+	ArrayType  *arr;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+
+	*blocker_pid = 0;
+	*blocker_count = 0;
+
+	result = OidFunctionCall1(F_PG_BLOCKING_PIDS, Int32GetDatum(pid));
+	arr = DatumGetArrayTypeP(result);
+	if (arr == NULL)
+		return;
+
+	deconstruct_array(arr, INT4OID, sizeof(int32), true, 'i',
+					  &elems, &nulls, &nelems);
+	*blocker_count = nelems;
+	if (nelems > 0 && !nulls[0])
+		*blocker_pid = DatumGetInt32(elems[0]);
+}
+
+/* Find the reported state of a pid among the rows collected this tick. */
+static char *
+ash_state_of_pid(ashActivityRow *rows, int nrows, int pid)
+{
+	int			i;
+
+	if (pid == 0)
+		return "";
+	for (i = 0; i < nrows; i++)
+		if (rows[i].pid == pid)
+			return rows[i].state;
+	return "";
+}
+
+/*
+ * Look up the parsed query/cmdtype/queryid the extension recorded for a pid in
+ * its own ProcEntryArray (populated by the post_parse_analyze hook).  This is
+ * extension-owned data, indexed the same way get_parsedinfo() indexes it.
+ */
+static procEntry *
+ash_proc_entry_of_pid(int pid)
+{
+	int			i;
+
+	for (i = 0; i < (int) ProcGlobal->allProcCount; i++)
+		if (ProcGlobal->allProcs[i].pid == pid)
+			return &ProcEntryArray[i];
+	return NULL;
+}
+
+/*
+ * Invoke pg_stat_get_activity(NULL) directly (no SPI, no SQL text) and return
+ * its materialized tuplestore together with the result descriptor.  The
+ * caller must eventually FreeExprContext(*econtext).
+ */
+static Tuplestorestate *
+ash_run_pg_stat_get_activity(ExprContext **econtext, TupleDesc *tupdesc)
+{
+	FmgrInfo		flinfo;
+	ReturnSetInfo	rsinfo;
+
+	*econtext = CreateStandaloneExprContext();
+
+	fmgr_info(F_PG_STAT_GET_ACTIVITY, &flinfo);
+
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	rsinfo.type = T_ReturnSetInfo;
+	rsinfo.econtext = *econtext;
+	rsinfo.expectedDesc = NULL;
+	rsinfo.allowedModes = SFRM_Materialize;
+	rsinfo.returnMode = SFRM_Materialize;
+	rsinfo.setResult = NULL;
+	rsinfo.setDesc = NULL;
+
+#if PG_VERSION_NUM >= 120000
+	{
+		LOCAL_FCINFO(fcinfo, 1);
+
+		InitFunctionCallInfoData(*fcinfo, &flinfo, 1, InvalidOid, NULL,
+								 (Node *) &rsinfo);
+		fcinfo->args[0].value = (Datum) 0;
+		fcinfo->args[0].isnull = true;	/* NULL pid -> every backend */
+		(void) FunctionCallInvoke(fcinfo);
+	}
+#else
+	{
+		FunctionCallInfoData fcinfo;
+
+		InitFunctionCallInfoData(fcinfo, &flinfo, 1, InvalidOid, NULL,
+								 (Node *) &rsinfo);
+		fcinfo.arg[0] = (Datum) 0;
+		fcinfo.argnull[0] = true;
+		(void) FunctionCallInvoke(&fcinfo);
+	}
+#endif
+
+	*tupdesc = rsinfo.setDesc;
+	return rsinfo.setResult;
+}
+
+/*
+ * Collect one ASH sample by walking what pg_stat_get_activity() returns and,
+ * for each interesting session, computing its blockers with pg_blocking_pids()
+ * and attaching the parsed query info the extension already tracks.  The shape
+ * of what we store matches the old SQL sampler so pg_active_session_history is
+ * unchanged.
+ */
+static void
+ash_collect_sample(TimestampTz ash_time, bool track_idle, bool *gotactives)
+{
+	ExprContext	   *econtext = NULL;
+	Tuplestorestate *tupstore;
+	TupleDesc		tupdesc = NULL;
+	TupleTableSlot *slot;
+	int				my_pid = MyProcPid;
+	ashActivityRow *rows;
+	int				nrows = 0;
+	int				maxrows = 64;
+	int				r;
+	int				a_datid,
+					a_pid,
+					a_usesysid,
+					a_appname,
+					a_state,
+					a_query,
+					a_wetype,
+					a_we,
+					a_xact_start,
+					a_query_start,
+					a_backend_start,
+					a_state_change,
+					a_client_addr,
+					a_client_hostname,
+					a_client_port,
+					a_backend_xid,
+					a_backend_xmin,
+					a_backend_type,
+					a_leader_pid,
+					a_query_id;
+
+	tupstore = ash_run_pg_stat_get_activity(&econtext, &tupdesc);
+	if (tupstore == NULL || tupdesc == NULL)
+	{
+		if (econtext != NULL)
+			FreeExprContext(econtext, true);
+		return;
+	}
+
+	a_datid = ash_activity_attno(tupdesc, "datid");
+	a_pid = ash_activity_attno(tupdesc, "pid");
+	a_usesysid = ash_activity_attno(tupdesc, "usesysid");
+	a_appname = ash_activity_attno(tupdesc, "application_name");
+	a_state = ash_activity_attno(tupdesc, "state");
+	a_query = ash_activity_attno(tupdesc, "query");
+	a_wetype = ash_activity_attno(tupdesc, "wait_event_type");
+	a_we = ash_activity_attno(tupdesc, "wait_event");
+	a_xact_start = ash_activity_attno(tupdesc, "xact_start");
+	a_query_start = ash_activity_attno(tupdesc, "query_start");
+	a_backend_start = ash_activity_attno(tupdesc, "backend_start");
+	a_state_change = ash_activity_attno(tupdesc, "state_change");
+	a_client_addr = ash_activity_attno(tupdesc, "client_addr");
+	a_client_hostname = ash_activity_attno(tupdesc, "client_hostname");
+	a_client_port = ash_activity_attno(tupdesc, "client_port");
+	a_backend_xid = ash_activity_attno(tupdesc, "backend_xid");
+	a_backend_xmin = ash_activity_attno(tupdesc, "backend_xmin");
+	a_backend_type = ash_activity_attno(tupdesc, "backend_type");
+	a_leader_pid = ash_activity_attno(tupdesc, "leader_pid");	/* >= 13 */
+	a_query_id = ash_activity_attno(tupdesc, "query_id");		/* >= 14 */
+
+#if PG_VERSION_NUM >= 120000
+	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
+#else
+	slot = MakeSingleTupleTableSlot(tupdesc);
+#endif
+
+	rows = (ashActivityRow *) palloc(sizeof(ashActivityRow) * maxrows);
+
+	/* Pass 1: pull every backend into a transient array. */
+	while (tuplestore_gettupleslot(tupstore, true, false, slot))
+	{
+		ashActivityRow *row;
+		bool		isnull;
+		Datum		value;
+
+		if (nrows >= maxrows)
+		{
+			maxrows *= 2;
+			rows = (ashActivityRow *) repalloc(rows,
+											   sizeof(ashActivityRow) * maxrows);
+		}
+		row = &rows[nrows++];
+		memset(row, 0, sizeof(*row));
+
+		if (a_pid > 0)
+		{
+			value = slot_getattr(slot, a_pid, &isnull);
+			row->pid = isnull ? 0 : DatumGetInt32(value);
+		}
+		if (a_leader_pid > 0)
+		{
+			value = slot_getattr(slot, a_leader_pid, &isnull);
+			row->leader_pid = isnull ? 0 : DatumGetInt32(value);
+		}
+		if (a_client_port > 0)
+		{
+			value = slot_getattr(slot, a_client_port, &isnull);
+			row->client_port = isnull ? 0 : DatumGetInt32(value);
+		}
+		if (a_datid > 0)
+		{
+			value = slot_getattr(slot, a_datid, &isnull);
+			row->datid = isnull ? InvalidOid : DatumGetObjectId(value);
+		}
+		if (a_usesysid > 0)
+		{
+			value = slot_getattr(slot, a_usesysid, &isnull);
+			row->usesysid = isnull ? InvalidOid : DatumGetObjectId(value);
+		}
+		if (a_backend_xid > 0)
+		{
+			value = slot_getattr(slot, a_backend_xid, &isnull);
+			row->backend_xid = isnull ? InvalidTransactionId
+				: DatumGetTransactionId(value);
+		}
+		if (a_backend_xmin > 0)
+		{
+			value = slot_getattr(slot, a_backend_xmin, &isnull);
+			row->backend_xmin = isnull ? InvalidTransactionId
+				: DatumGetTransactionId(value);
+		}
+		if (a_backend_start > 0)
+		{
+			value = slot_getattr(slot, a_backend_start, &isnull);
+			row->backend_start = isnull ? 0 : DatumGetTimestampTz(value);
+		}
+		if (a_xact_start > 0)
+		{
+			value = slot_getattr(slot, a_xact_start, &isnull);
+			row->xact_start = isnull ? 0 : DatumGetTimestampTz(value);
+		}
+		if (a_query_start > 0)
+		{
+			value = slot_getattr(slot, a_query_start, &isnull);
+			row->query_start = isnull ? 0 : DatumGetTimestampTz(value);
+		}
+		if (a_state_change > 0)
+		{
+			value = slot_getattr(slot, a_state_change, &isnull);
+			row->state_change = isnull ? 0 : DatumGetTimestampTz(value);
+		}
+		if (a_query_id > 0)
+		{
+			value = slot_getattr(slot, a_query_id, &isnull);
+			row->query_id = isnull ? 0 : (uint64) DatumGetInt64(value);
+		}
+
+		row->application_name = ash_activity_text(slot, a_appname, "");
+		row->state = ash_activity_text(slot, a_state, "");
+		row->top_level_query = ash_activity_text(slot, a_query, "");
+		row->wait_event_type = ash_activity_text(slot, a_wetype, "CPU");
+		row->wait_event = ash_activity_text(slot, a_we, "CPU");
+		row->client_hostname = ash_activity_text(slot, a_client_hostname, "");
+		row->backend_type = ash_activity_text(slot, a_backend_type, "");
+
+		/* client_addr is inet; render it via the type's own output function. */
+		row->client_addr = "";
+		if (a_client_addr > 0)
+		{
+			value = slot_getattr(slot, a_client_addr, &isnull);
+			if (!isnull)
+				row->client_addr =
+					DatumGetCString(OidFunctionCall1(F_INET_OUT, value));
+		}
+	}
+
+	/* Pass 2: keep the sessions the old WHERE clause would have kept. */
+	for (r = 0; r < nrows; r++)
+	{
+		ashActivityRow *row = &rows[r];
+		bool		wanted;
+		int			blocker_pid;
+		int			blocker_count;
+		char	   *blocker_state;
+		char	   *datname;
+		char	   *usename;
+		procEntry  *pe;
+		const char *gpi_query = "";
+		const char *cmdtype = "";
+		uint64		queryid;
+
+		if (row->pid <= 0 || row->pid == my_pid)
+			continue;
+
+		wanted = (strcmp(row->state, "active") == 0) ||
+			(track_idle && strcmp(row->state, "idle in transaction") == 0);
+		if (!wanted)
+			continue;
+
+		ash_get_blockers(row->pid, &blocker_pid, &blocker_count);
+		blocker_state = ash_state_of_pid(rows, nrows, blocker_pid);
+
+		pe = ash_proc_entry_of_pid(row->pid);
+		queryid = (pe != NULL) ? pe->queryid : 0;
+		if (row->query_id != 0)
+			queryid = row->query_id;
+		if (pe != NULL)
+		{
+			if (pe->query != NULL && pe->query[0] != '\0')
+				gpi_query = pe->query;
+			if (pe->cmdtype != NULL && pe->cmdtype[0] != '\0')
+				cmdtype = pe->cmdtype;
+		}
+
+		datname = OidIsValid(row->datid) ? get_database_name(row->datid) : NULL;
+		usename = OidIsValid(row->usesysid)
+			? GetUserNameFromId(row->usesysid, true) : NULL;
+
+		*gotactives = true;
+
+		ash_prepare_store(ash_time,
+						  row->pid,
+#if PG_VERSION_NUM >= 130000
+						  row->leader_pid,
+#endif
+						  usename ? usename : "",
+						  row->client_port,
+						  row->datid,
+						  datname ? datname : "",
+						  row->application_name,
+						  row->client_addr,
+						  row->backend_xmin,
+						  row->backend_start,
+						  row->xact_start,
+						  row->query_start,
+						  row->state_change,
+						  row->wait_event_type,
+						  row->wait_event,
+						  row->state,
+						  row->client_hostname,
+						  row->top_level_query,
+						  row->backend_type,
+						  row->usesysid,
+						  row->backend_xid,
+						  blocker_count,
+						  blocker_pid,
+						  blocker_state,
+						  queryid,
+						  gpi_query,
+						  cmdtype);
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExprContext(econtext, true);
+}
+
 void
 pgsentinel_main(Datum main_arg)
 {
@@ -965,286 +1311,21 @@ letswait:
 			goto letswait;
 		}
 
-		SPI_connect();
-
-		if (ash_track_idle_trans)
-		{
-			pgstat_report_activity(STATE_RUNNING, pgsa_query_track_idle);
-
-			/* We can now execute queries via SPI */
-			ret = SPI_execute(pgsa_query_track_idle, true, 0);
-		}
-		else
-		{
-			pgstat_report_activity(STATE_RUNNING, pgsa_query_no_track_idle);
-
-			/* We can now execute queries via SPI */
-			ret = SPI_execute(pgsa_query_no_track_idle, true, 0);
-		}
-
-		if (ret != SPI_OK_SELECT)
-			elog(FATAL, "cannot select from pg_stat_activity: error code %d", ret);
-
-		ash_time=GetCurrentTimestamp();
-		/* Do some processing */
-
-		if (SPI_processed > 0)
-		{
-			gotactives=true;
-			for (i = 0; i < SPI_processed; i++)
-			{
-				bool isnull;
-				Datum data;
-				char *usenamevalue=NULL;
-				char *datnamevalue=NULL;
-				char *appnamevalue=NULL;
-				char *wait_event_typevalue=NULL;
-				char *wait_eventvalue=NULL;
-				char *client_hostnamevalue=NULL;
-				char *queryvalue=NULL;
-				char *backend_typevalue=NULL;
-				char *statevalue=NULL;
-				char *blockerstatevalue=NULL;
-				char *clientaddrvalue=NULL;
-				int pidvalue;
-#if PG_VERSION_NUM >= 130000
-				int leader_pidvalue;
-#endif
-				int client_portvalue;
-				int blockersvalue;
-				int blockerpidvalue;
-				Oid datidvalue;
-				Oid usesysidvalue;
-				TransactionId backend_xminvalue;
-				TransactionId backend_xidvalue;
-				TimestampTz backend_startvalue;
-				TimestampTz xact_startvalue;
-				TimestampTz query_startvalue;
-				TimestampTz state_changevalue;
-				uint64 queryidvalue;
-				char *gpi_queryvalue = NULL;
-				char *cmdtypevalue = NULL;
-
-				/* Fetch values */
-
-				/* datid */
-				datidvalue = DatumGetObjectId(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,1, &isnull));
-
-				/* usesysid */
-				usesysidvalue = DatumGetObjectId(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,4, &isnull));
-
-				/* datname */
-				datnamevalue = DatumGetCString(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,2, &isnull));
-
-				/* pid */
-				pidvalue = DatumGetInt32(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,3, &isnull));
-
-#if PG_VERSION_NUM >= 100000
-				/* blockerpid */
-				blockerpidvalue = DatumGetInt32(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,21, &isnull));
-
-				/* blockers */
-				blockersvalue = DatumGetInt32(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,22, &isnull));
-#else
-				/* blockerpid */
-				blockerpidvalue = DatumGetInt32(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,20, &isnull));
-
-				/* blockers */
-				blockersvalue = DatumGetInt32(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,21, &isnull));
-#endif
-
-				/* client_port */
-				client_portvalue = DatumGetInt32(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,9, &isnull));
-
-				/* usename */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																	5, &isnull);
-				if (!isnull) {
-					usenamevalue = DatumGetCString(data);
-				}
-
-				/* appname */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																	6, &isnull);
-				if (!isnull) {
-					appnamevalue = TextDatumGetCString(data);
-				}
-
-				/* wait_event_type */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																14, &isnull);
-				if (!isnull) {
-					wait_event_typevalue = TextDatumGetCString(data);
-				}
-
-				/* wait_event */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																15, &isnull);
-				if (!isnull) {
-					wait_eventvalue = TextDatumGetCString(data);
-				}
-
-				/* state */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																16, &isnull);
-				if (!isnull) {
-					statevalue = TextDatumGetCString(data);
-				}
-
-#if PG_VERSION_NUM >= 100000
-				/* blocker state */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																23, &isnull);
-				if (!isnull) {
-					blockerstatevalue = TextDatumGetCString(data);
-				}
-
-				/* queryid */
-				queryidvalue = DatumGetUInt64(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,25, &isnull));
-
-				/* gpi query */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																26, &isnull);
-				if (!isnull) {
-					gpi_queryvalue = TextDatumGetCString(data);
-				}
-
-				/* cmdtype */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																27, &isnull);
-				if (!isnull) {
-					cmdtypevalue = TextDatumGetCString(data);
-				}
-#else
-				/* blocker state */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																22, &isnull);
-				if (!isnull) {
-					blockerstatevalue = TextDatumGetCString(data);
-				}
-
-				/* queryid */
-				queryidvalue = DatumGetUInt64(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,24, &isnull));
-
-				/* gpi query */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																25, &isnull);
-				if (!isnull) {
-					gpi_queryvalue = TextDatumGetCString(data);
-				}
-
-				/* cmdtype */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																26, &isnull);
-				if (!isnull) {
-					cmdtypevalue = TextDatumGetCString(data);
-				}
-#endif
-
-				/* client_hostname */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																	8, &isnull);
-				if (!isnull) {
-					client_hostnamevalue = TextDatumGetCString(data);
-				}
-
-				/* query */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																19, &isnull);
-				if (!isnull) {
-					queryvalue = TextDatumGetCString(data);
-				}
-
-#if PG_VERSION_NUM >= 100000
-				/* backend_type */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																20, &isnull);
-				if (!isnull) {
-					backend_typevalue = TextDatumGetCString(data);
-				}
-#endif
-
-				/* client addr */
-				data=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,
-																7, &isnull);
-				if (!isnull) {
-					clientaddrvalue = TextDatumGetCString(data);
-				}
-
-				/* backend xid */
-				backend_xidvalue = DatumGetTransactionId(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,17, &isnull));
-
-				/* backedn xmin */
-				backend_xminvalue = DatumGetTransactionId(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,18, &isnull));
-
-				/* backend start */
-				backend_startvalue = DatumGetTimestamp(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,10, &isnull));
-
-				/* xact start */
-				xact_startvalue = DatumGetTimestamp(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,11, &isnull));
-
-				/* query start */
-				query_startvalue = DatumGetTimestamp(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,12, &isnull));
-
-				/* state change */
-				state_changevalue = DatumGetTimestamp(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,13, &isnull));
-#if PG_VERSION_NUM >= 130000
-				/* leader pid */
-				leader_pidvalue = DatumGetInt32(SPI_getbinval(
-					SPI_tuptable->vals[i],SPI_tuptable->tupdesc,28, &isnull));
-#endif
-
-				/* prepare to store the entry */
-				ash_prepare_store(ash_time, pidvalue,
-#if PG_VERSION_NUM >= 130000
-									leader_pidvalue,
-#endif
-									usenamevalue ? usenamevalue : "\0",
-									client_portvalue, datidvalue,
-									datnamevalue ? datnamevalue : "\0",
-									appnamevalue ? appnamevalue : "\0",
-									clientaddrvalue ? clientaddrvalue : "\0",
-									backend_xminvalue, backend_startvalue,
-									xact_startvalue,query_startvalue,
-									state_changevalue,
-									wait_event_typevalue ? wait_event_typevalue : "\0",
-									wait_eventvalue ? wait_eventvalue : "\0",
-									statevalue ? statevalue : "\0",
-									client_hostnamevalue ? client_hostnamevalue : "\0",
-									queryvalue ? queryvalue : "\0",
-									backend_typevalue ? backend_typevalue : "\0",
-									usesysidvalue, backend_xidvalue,
-									blockersvalue, blockerpidvalue,
-									blockerstatevalue ? blockerstatevalue : "\0",
-									queryidvalue,
-									gpi_queryvalue ? gpi_queryvalue : "\0",
-									cmdtypevalue ? cmdtypevalue : "\0");
-			}
-		}
-		SPI_finish();
+		/*
+		 * Sample by calling pg_stat_get_activity() and pg_blocking_pids()
+		 * directly instead of running a SQL query over SPI: no statement is
+		 * parsed or planned, we just consume what those functions return.
+		 */
+		pgstat_report_activity(STATE_RUNNING,
+							   "pgsentinel: collecting ASH sample");
+		ash_time = GetCurrentTimestamp();
+		ash_collect_sample(ash_time, ash_track_idle_trans, &gotactives);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		pgstat_report_activity(STATE_IDLE, NULL);
 
 		/* pg_stat_statement_history */
-		if (gotactives && pgssh_enable) 
+		if (gotactives && pgssh_enable)
 		{
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();
