@@ -57,7 +57,22 @@
 #include "utils/array.h"
 #include "utils/fmgroids.h"
 #include "catalog/pg_type.h"
+/*
+ * get_database_name() lives in commands/dbcommands.h up to PostgreSQL 18 and
+ * in utils/lsyscache.h from 19 on; both headers exist on every supported
+ * version, so include them unconditionally and let the right one declare it.
+ */
 #include "commands/dbcommands.h"
+#include "utils/lsyscache.h"
+
+/*
+ * PostgreSQL 19 gave signal handlers a second argument, so a bare SIG_IGN no
+ * longer matches pqsigfunc and PG_SIG_IGN was added to cast it.  Older
+ * versions pass SIG_IGN straight through.
+ */
+#if PG_VERSION_NUM < 190000
+#define PG_SIG_IGN SIG_IGN
+#endif
 
 /* Handle privilege checking across PostgreSQL versions */
 #if PG_VERSION_NUM >= 150000
@@ -1283,7 +1298,7 @@ pgsentinel_main(Datum main_arg)
 
 	/* Register functions for SIGTERM/SIGHUP management */
 	pqsignal(SIGHUP, pgsentinel_sighup);
-	pqsignal(SIGINT, SIG_IGN);
+	pqsignal(SIGINT, PG_SIG_IGN);
 	pqsignal(SIGTERM, pgsentinel_sigterm);
 
 	/* We're now ready to receive signals */
