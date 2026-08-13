@@ -21,6 +21,8 @@
 #include "access/hash.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
+/* Reached indirectly before PostgreSQL 19; include it for the tuplestore API. */
+#include "utils/tuplestore.h"
 #include "commands/extension.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
@@ -88,7 +90,7 @@ void
 #if PG_VERSION_NUM < 140000
 getparsedinfo_post_parse_analyze(ParseState *pstate, Query *query)
 #else
-getparsedinfo_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
+getparsedinfo_post_parse_analyze(ParseState *pstate, Query *query, PGS_JUMBLESTATE *jstate)
 #endif
 {
 

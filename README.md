@@ -120,6 +120,51 @@ You can see it as samplings of `pg_stat_activity` providing more information:
 * `blockerpid`: the pid of the blocker (if blockers = 1), the pid of one blocker (if blockers > 1)
 * `blocker_state`: state of the blocker (state of the blockerpid) 
 
+### Sampler implementation
+
+On every tick `pgsentinel` collects ASH samples by calling the built-in
+functions `pg_stat_get_activity()` and `pg_blocking_pids()` directly through
+the fmgr, rather than by executing a large `pg_stat_activity` self-join through
+SPI. This avoids the cost of parsing, planning and executing that query on each
+sample while still relying only on PostgreSQL's own documented functions: the
+extension consumes the rows `pg_stat_get_activity()` returns and the array of
+blocking pids `pg_blocking_pids()` returns, and builds the blocker resolution
+around those results instead of duplicating any core algorithm inside the
+extension. Blockers are resolved with a single `pg_blocking_pids()` call per
+sampled backend.
+
+The columns of `pg_active_session_history` and the extension's configuration
+are unchanged. One value behaves differently: with `compute_query_id = off`,
+`pg_stat_activity.query_id` is empty, and `queryid` now falls back to the id
+`pgsentinel` computes in its own parse hook instead of being reported as `0`.
+With `compute_query_id = on` — the setting that makes `queryid` joinable to
+`pg_stat_statements` — the value is unchanged.
+
+#### Sampling overhead
+
+Cost of one sample, measured on PostgreSQL 18.4 (8 cores) against the previous
+SPI/SQL sampler. Sessions were held `active` with `pg_sleep()` so that the
+sampler had to describe all of them while they consumed no CPU themselves; the
+figures are the bgworker's own CPU time over a 90 second window, and were
+cross-checked by timing the old SQL statement directly.
+
+| Active sessions | SPI/SQL sampler | Direct calls | Ratio |
+|---:|---:|---:|---:|
+| 25  | 1.7 ms  | 0.1 ms | 17x |
+| 50  | 3.6 ms  | 0.2 ms | 18x |
+| 100 | 6.1 ms  | 0.3 ms | 20x |
+| 200 | 20.8 ms | 0.6 ms | 35x |
+
+The ratio widens with concurrency because the two samplers scale differently:
+doubling the sessions from 100 to 200 multiplies the SQL sampler's cost by 3.4
+(it self-joins `pg_stat_activity` and calls `pg_blocking_pids()` twice per row),
+while the direct path grows by exactly 2.
+
+In absolute terms the sampler is cheap either way at the default one second
+period — 20.8 ms per second is 2% of a single core. The difference matters on
+instances with many active sessions, on machines that are already CPU bound, or
+where the periodic planner work of the old statement was itself the problem.
+
 `pgsentinel` also reports query statistics history through the `pg_stat_statements_history` view:
 
 
