@@ -849,6 +849,28 @@ ash_activity_attno(TupleDesc tupdesc, const char *name)
 	return 0;
 }
 
+/*
+ * Insist that a column every supported pg_stat_get_activity() returns was
+ * actually found.  Resolving one to 0 means the shape of that function changed
+ * under us, and because a missing attribute silently falls back to a default
+ * the sampler would keep running while reporting nonsense: a renamed
+ * wait_event_type would mark every session as "CPU", and a renamed state would
+ * match nothing and quietly collect an empty history.  Refuse to sample on
+ * instead, the way the SPI sampler used to fail when its query stopped
+ * matching pg_stat_activity.
+ *
+ * Columns that are genuinely optional across versions (backend_type before 10,
+ * leader_pid before 13, query_id before 14) are not checked here; their
+ * defaults are the intended behaviour.
+ */
+static void
+ash_require_activity_attno(int attno, const char *name)
+{
+	if (attno <= 0)
+		elog(FATAL,
+			 "pgsentinel: pg_stat_get_activity() has no \"%s\" column", name);
+}
+
 /* Read a text column, returning def when the attribute is missing or NULL. */
 static char *
 ash_activity_text(TupleTableSlot *slot, int attno, char *def)
@@ -1042,6 +1064,28 @@ ash_collect_sample(TimestampTz ash_time, bool track_idle, bool *gotactives)
 	a_backend_type = ash_activity_attno(tupdesc, "backend_type");
 	a_leader_pid = ash_activity_attno(tupdesc, "leader_pid");	/* >= 13 */
 	a_query_id = ash_activity_attno(tupdesc, "query_id");		/* >= 14 */
+
+	/* Everything below is expected on every version we build against. */
+	ash_require_activity_attno(a_datid, "datid");
+	ash_require_activity_attno(a_pid, "pid");
+	ash_require_activity_attno(a_usesysid, "usesysid");
+	ash_require_activity_attno(a_appname, "application_name");
+	ash_require_activity_attno(a_state, "state");
+	ash_require_activity_attno(a_query, "query");
+	ash_require_activity_attno(a_wetype, "wait_event_type");
+	ash_require_activity_attno(a_we, "wait_event");
+	ash_require_activity_attno(a_xact_start, "xact_start");
+	ash_require_activity_attno(a_query_start, "query_start");
+	ash_require_activity_attno(a_backend_start, "backend_start");
+	ash_require_activity_attno(a_state_change, "state_change");
+	ash_require_activity_attno(a_client_addr, "client_addr");
+	ash_require_activity_attno(a_client_hostname, "client_hostname");
+	ash_require_activity_attno(a_client_port, "client_port");
+	ash_require_activity_attno(a_backend_xid, "backend_xid");
+	ash_require_activity_attno(a_backend_xmin, "backend_xmin");
+#if PG_VERSION_NUM >= 100000
+	ash_require_activity_attno(a_backend_type, "backend_type");
+#endif
 
 #if PG_VERSION_NUM >= 120000
 	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
