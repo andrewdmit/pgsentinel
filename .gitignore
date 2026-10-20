@@ -15,3 +15,16 @@ target/
 /eclipsebin/
 *.o
 
+
+# Build output
+*.so
+*.bc
+
+# Regression test output (make installcheck / installcheck-all)
+src/log/
+src/results/
+src/output_iso/
+src/tmp_check/
+src/tmp_check_iso/
+src/regression.diffs
+src/regression.out

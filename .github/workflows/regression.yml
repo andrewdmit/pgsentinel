@@ -46,7 +46,7 @@ jobs:
 
       - name: Show regression.diffs for enabled test
         if: ${{ failure() }}
-        run: cat src/regression.diffs || true
+        run: cat src/regression.diffs src/output_iso/regression.diffs || true
 
       - name: Reset PostgreSQL cluster
         run: |
@@ -67,4 +67,4 @@ jobs:
 
       - name: Show regression.diffs for disabled test
         if: ${{ failure() }}
-        run: cat src/regression.diffs || true
+        run: cat src/regression.diffs src/output_iso/regression.diffs || true

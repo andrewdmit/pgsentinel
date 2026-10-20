@@ -73,6 +73,41 @@ restart the postgresql daemon and create the extension:
     $ psql DB -c "CREATE EXTENSION pgsentinel;"
 
 
+Testing
+-------
+
+The regression tests start throwaway PostgreSQL instances, so they need the
+server binaries (`initdb`, `postgres`) of the version `pg_config` points at and
+must run as a non-root user. After `make install`:
+
+    $ cd pgsentinel/src
+    $ make installcheck-all
+
+Each suite gets a fresh instance, and no running server is touched. `make`
+exits non-zero if anything fails, so the command can run unattended:
+
+ * `pgsentinel-test`: sampling, `queryid` and `nested_queryid`, idle in
+   transaction tracking, `pg_stat_statements_history`, privileges;
+ * `pgsentinel-upgrade-test`: with a library newer than the installed SQL
+   definition, reading the view reports an error instead of crashing the
+   server, and `ALTER EXTENSION pgsentinel UPDATE` recovers;
+ * `pgsentinel-blockers` (isolation test): `blockers`, `blockerpid` and
+   `blocker_state` checked against `pg_blocking_pids()` for a row lock wait and
+   for a table lock held by two sessions, along with the waiter's other columns;
+ * `pgsentinel-disabled-test`: sampling with `pgsentinel_pgssh.enable = off`.
+
+A failure leaves its differences in `regression.diffs` and
+`output_iso/regression.diffs`.
+
+`DEB_BUILD_GNU_TYPE=1 make installcheck` runs the suites against a server that
+is already running instead, which is how CI uses them. That server has to be
+newly created with `pgsentinel.conf` appended to its configuration: the tests
+expect an empty session history and a `contrib_regression` database that
+pgsentinel's worker is not yet attached to, and they leave
+`pgsentinel_ash.track_idle_trans` on through `ALTER SYSTEM`. Don't point them
+at a server you care about.
+
+
 Usage
 -----
 

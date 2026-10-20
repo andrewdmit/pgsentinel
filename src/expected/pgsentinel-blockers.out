@@ -1,0 +1,18 @@
+Parsed test spec with 4 sessions
+
+starting permutation: h1_row w_row o_row h1_commit
+step h1_row: BEGIN; UPDATE ash_lock_target SET id = id;
+step w_row: UPDATE ash_lock_target SET id = id; <waiting ...>
+step o_row: DO $$ BEGIN PERFORM ash_check_blocked(1, 'transactionid', 'UPDATE'); END $$;
+step h1_commit: COMMIT;
+step w_row: <... completed>
+
+starting permutation: h1_share h2_share w_excl o_excl h1_commit h2_commit w_commit
+step h1_share: BEGIN; LOCK TABLE ash_lock_target IN ACCESS SHARE MODE;
+step h2_share: BEGIN; LOCK TABLE ash_lock_target IN ACCESS SHARE MODE;
+step w_excl: BEGIN; LOCK TABLE ash_lock_target IN ACCESS EXCLUSIVE MODE; <waiting ...>
+step o_excl: DO $$ BEGIN PERFORM ash_check_blocked(2, 'relation', 'UTILITY'); END $$;
+step h1_commit: COMMIT;
+step h2_commit: COMMIT;
+step w_excl: <... completed>
+step w_commit: COMMIT;
