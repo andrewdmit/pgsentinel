@@ -1724,6 +1724,20 @@ pg_active_session_history_internal(FunctionCallInfo fcinfo)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
+	/*
+	 * The rows below are built for the current SQL definition.  After the
+	 * library is upgraded but before ALTER EXTENSION ... UPDATE, the installed
+	 * definition can still have the previous shape (1.4.1 lacks
+	 * nested_queryid); storing our values under it would read an int8 as a
+	 * text pointer and crash the server.
+	 */
+	if (tupdesc->natts != PG_ACTIVE_SESSION_HISTORY_COLS)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_active_session_history returns %d columns but the installed definition has %d",
+						PG_ACTIVE_SESSION_HISTORY_COLS, tupdesc->natts),
+				 errhint("Run ALTER EXTENSION pgsentinel UPDATE.")));
+
 	tupstore = tuplestore_begin_heap(true, false, work_mem);
 	rsinfo->returnMode = SFRM_Materialize;
 	rsinfo->setResult = tupstore;
