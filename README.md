@@ -1,7 +1,7 @@
 `pgsentinel` – sampling active session history
 =============================================================
 
-[![Build Status](https://travis-ci.org/pgsentinel/pgsentinel.svg?branch=master)](https://travis-ci.org/pgsentinel/pgsentinel)
+[![Build Status](https://github.com/pgsentinel/pgsentinel/actions/workflows/regression.yml/badge.svg)](https://github.com/pgsentinel/pgsentinel/actions/workflows/regression.yml)
 
 Introduction
 ------------
@@ -104,6 +104,7 @@ Usage
   | query            | text                     |           |          |  |
   | cmdtype          | text                     |           |          |  |
   | queryid          | bigint                   |           |          |  |
+  | nested_queryid   | bigint                   |           |          |  |
   | backend_type     | text                     |           |          |  |
   | blockers         | integer                  |           |          |  |
   | blockerpid       | integer                  |           |          |  |
@@ -112,10 +113,11 @@ Usage
 You can see it as samplings of `pg_stat_activity` providing more information:
 
 * `ash_time`: the sampling time
-* `top_level_query`: the top level statement (in case PL/pgSQL is used)
-* `query`: the statement being executed (not normalised, as it is in `pg_stat_statements`, which means you see parameter values)
+* `top_level_query`: the top-level statement from `pg_stat_activity.query` (in case PL/pgSQL is used)
+* `query`: the statement currently being executed, from `get_parsedinfo()` (not normalised, so parameter values are visible)
 * `cmdtype`: the statement type (SELECT,UPDATE,INSERT,DELETE,UTILITY,UNKNOWN,NOTHING)
-* `queryid`: the queryid of the statement which links to pg_stat_statements
+* `queryid`: the top-level query ID from `pg_stat_activity.query_id`[^1], which links to `pg_stat_statements`
+* `nested_queryid`: the query ID returned by `get_parsedinfo()` for the statement currently being executed
 * `blockers`: the number of blockers
 * `blockerpid`: the pid of the blocker (if blockers = 1), the pid of one blocker (if blockers > 1)
 * `blocker_state`: state of the blocker (state of the blockerpid) 
@@ -133,8 +135,9 @@ around those results instead of duplicating any core algorithm inside the
 extension. Blockers are resolved with a single `pg_blocking_pids()` call per
 sampled backend.
 
-The columns of `pg_active_session_history` and the extension's configuration
-are unchanged. One value behaves differently: with `compute_query_id = off`,
+Switching to the direct calls did not change the columns of
+`pg_active_session_history` or the extension's configuration. One value
+behaves differently: with `compute_query_id = off`,
 `pg_stat_activity.query_id` is empty, and `queryid` now falls back to the id
 `pgsentinel` computes in its own parse hook instead of being reported as `0`.
 With `compute_query_id = on` — the setting that makes `queryid` joinable to
@@ -164,6 +167,8 @@ In absolute terms the sampler is cheap either way at the default one second
 period — 20.8 ms per second is 2% of a single core. The difference matters on
 instances with many active sessions, on machines that are already CPU bound, or
 where the periodic planner work of the old statement was itself the problem.
+
+[^1]: When `pg_stat_activity.query_id` is not available — before PostgreSQL 14, or with `compute_query_id = off` — `queryid` falls back to the id from `get_parsedinfo()` and therefore matches `nested_queryid`.
 
 `pgsentinel` also reports query statistics history through the `pg_stat_statements_history` view:
 
@@ -212,6 +217,7 @@ Remark
 -------------------------
 
 * Some fields may be NULL depending on the version (for example, `leader_pid` is NULL for version <= 13.0...)
+* Since 1.5.1, `PUBLIC` can't execute `get_parsedinfo()`, which returns the raw query text of every backend. An existing install gets this only after `ALTER EXTENSION pgsentinel UPDATE`, run in each database that has the extension. A role granted `EXECUTE` sees the query text of all sessions.
 
 See how to query the view in this short video
 -------------

@@ -29,6 +29,7 @@
 #include "utils/date.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/tuplestore.h"
 #include "funcapi.h"
 #include "optimizer/planner.h"
 #include "storage/shm_toc.h"
@@ -39,6 +40,7 @@
 #include "commands/extension.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_type.h"
 #include "utils/acl.h"
 /*
  * Headers for the sampling path.  Rather than re-implementing the bodies of
@@ -87,7 +89,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_active_session_history);
 PG_FUNCTION_INFO_V1(pg_stat_statements_history);
 
-#define PG_ACTIVE_SESSION_HISTORY_COLS        28
+#define PG_ACTIVE_SESSION_HISTORY_COLS        29
 #define PG_STAT_STATEMENTS_HISTORY_COLS       24
 #define EXTENSION_NAME "pgsentinel"
 
@@ -124,31 +126,60 @@ static char *pgsentinelDbName = "postgres";
 static char *worker_name = "pgsentinel";
 
 
+/*
+ * pg_stat_statements query, a format string: %1$s is the quoted schema of
+ * pg_stat_statements and %2$s that of pgsentinel.
+ */
 static const char * const pg_stat_statements_query=
 #if PG_VERSION_NUM < 130000
 "select userid, dbid, queryid, calls, total_time, rows, shared_blks_hit, \
  shared_blks_read, shared_blks_dirtied, shared_blks_written, local_blks_hit, \
  local_blks_read, local_blks_dirtied, local_blks_written, temp_blks_read, \
- temp_blks_written, blk_read_time, blk_write_time from pg_stat_statements \
- where queryid in  (select queryid from pg_active_session_history  \
- where ash_time in (select ash_time from pg_active_session_history  \
- order by ash_time desc limit 1))";
-#else
+ temp_blks_written, blk_read_time, blk_write_time from %1$s.pg_stat_statements(false) \
+ where queryid in  (select queryid from %2$s.pg_active_session_history  \
+ where ash_time in (select ash_time from %2$s.pg_active_session_history  \
+ order by ash_time desc limit 2) \
+ union select nested_queryid from %2$s.pg_active_session_history \
+ where ash_time in (select ash_time from %2$s.pg_active_session_history \
+ order by ash_time desc limit 2))";
+#elif PG_VERSION_NUM < 170000
 "select userid, dbid, queryid, calls, total_exec_time, rows, shared_blks_hit, \
  shared_blks_read, shared_blks_dirtied, shared_blks_written, local_blks_hit, \
  local_blks_read, local_blks_dirtied, local_blks_written, temp_blks_read, \
  temp_blks_written, blk_read_time, blk_write_time, \
  plans, total_plan_time, wal_records, wal_fpi, wal_bytes \
- from pg_stat_statements \
- where queryid in  (select queryid from pg_active_session_history  \
- where ash_time in (select ash_time from pg_active_session_history  \
- order by ash_time desc limit 1))";
+ from %1$s.pg_stat_statements(false) \
+ where queryid in  (select queryid from %2$s.pg_active_session_history  \
+ where ash_time in (select ash_time from %2$s.pg_active_session_history  \
+ order by ash_time desc limit 2) \
+ union select nested_queryid from %2$s.pg_active_session_history \
+ where ash_time in (select ash_time from %2$s.pg_active_session_history \
+ order by ash_time desc limit 2))";
+#else
+"select userid, dbid, queryid, calls, total_exec_time, rows, shared_blks_hit, \
+ shared_blks_read, shared_blks_dirtied, shared_blks_written, local_blks_hit, \
+ local_blks_read, local_blks_dirtied, local_blks_written, temp_blks_read, \
+ temp_blks_written, shared_blk_read_time, shared_blk_write_time, \
+ plans, total_plan_time, wal_records, wal_fpi, wal_bytes \
+ from %1$s.pg_stat_statements(false) \
+ where queryid in  (select queryid from %2$s.pg_active_session_history  \
+ where ash_time in (select ash_time from %2$s.pg_active_session_history  \
+ order by ash_time desc limit 2) \
+ union select nested_queryid from %2$s.pg_active_session_history \
+ where ash_time in (select ash_time from %2$s.pg_active_session_history \
+ order by ash_time desc limit 2))";
 #endif
+
+/* quoted schema of the extension named $1 */
+static const char * const extension_schema_query=
+"select quote_ident(n.nspname) from pg_extension e \
+ join pg_namespace n on n.oid = e.extnamespace where e.extname = $1";
 
 static void pg_active_session_history_internal(FunctionCallInfo fcinfo);
 static void pg_stat_statements_history_internal(FunctionCallInfo fcinfo);
 
 procEntry *ProcEntryArray = NULL;
+int proc_entry_count = 0;
 post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 
 /* ash entry */
@@ -160,6 +191,7 @@ typedef struct ashEntry
 #endif
 	int client_port;
 	uint64 queryid;
+	uint64 nested_queryid;
 	TimestampTz ash_time;
 	Oid datid;
 	Oid usesysid;
@@ -250,6 +282,9 @@ static Size ash_entry_memsize(void);
 /* check extension is loaded/present */
 static bool PgSentinelHasBeenLoaded(void);
 
+/* quoted schema name of an extension */
+static char *quoted_extension_schema(const char *extname, MemoryContext mcxt);
+
 /* store ash entry */
 static void ash_entry_store(TimestampTz ash_time,const int pid,
 #if PG_VERSION_NUM >= 130000
@@ -266,6 +301,7 @@ static void ash_entry_store(TimestampTz ash_time,const int pid,
 							Oid usesysid, TransactionId backend_xid,
 							int blockers, int blockerpid,
 							const char *blocker_state, uint64 queryid,
+							uint64 nested_queryid,
 							const char *gpi_query, const char *cmdtype);
 
 /* prepare store ash */
@@ -287,7 +323,8 @@ static void ash_prepare_store(TimestampTz ash_time,const int pid,
 								const char *backend_type, Oid usesysid,
 								TransactionId backend_xid, int blockers,
 								int blockerpid, const char *blocker_state,
-								uint64 queryid, const char *gpi_query,
+								uint64 queryid, uint64 nested_queryid,
+								const char *gpi_query,
 								const char *cmdtype);
 
 /* Estimate amount of shared memory needed for ash entry */
@@ -390,7 +427,19 @@ ash_shmem_startup(void)
 			MemSet(PgsshEntryArray, 0, size);
 	}
 
-	size = mul_size(sizeof(procEntry), get_max_procs_count());
+	/* ProcEntryArray is indexed like ProcGlobal->allProcs */
+	proc_entry_count = get_max_procs_count();
+
+	/*
+	 * This should always hold. In production warn and carry on, but fail
+	 * hard in assert builds so the mismatch is caught in development.
+	 */
+	if ((uint32) proc_entry_count != ProcGlobal->allProcCount)
+		elog(WARNING, "pgsentinel: ProcEntryArray has %d entries but ProcGlobal->allProcCount is %u",
+			 proc_entry_count, ProcGlobal->allProcCount);
+	Assert((uint32) proc_entry_count == ProcGlobal->allProcCount);
+
+	size = mul_size(sizeof(procEntry), proc_entry_count);
 	ProcEntryArray = (procEntry *) ShmemInitStruct("Get_parsedinfo Proc Entry",
 																size, &found);
 
@@ -399,7 +448,7 @@ ash_shmem_startup(void)
 		MemSet(ProcEntryArray, 0, size);
 	}
 
-	size = mul_size(pgstat_track_activity_query_size, get_max_procs_count());
+	size = mul_size(pgstat_track_activity_query_size, proc_entry_count);
 	ProcQueryBuffer = (char *) ShmemInitStruct("Proc Query Buffer", size,
 																	&found);
 
@@ -409,14 +458,14 @@ ash_shmem_startup(void)
 
 		/* Initialize pointers. */
 		buffer = ProcQueryBuffer;
-		for (i = 0; i < get_max_procs_count(); i++)
+		for (i = 0; i < proc_entry_count; i++)
 		{
 			ProcEntryArray[i].query= buffer;
 			buffer += pgstat_track_activity_query_size;
 		}
 	}
 
-	size = mul_size(NAMEDATALEN, get_max_procs_count());
+	size = mul_size(NAMEDATALEN, proc_entry_count);
 	ProcCmdTypeBuffer = (char *) ShmemInitStruct("Proc CmdType Buffer", size,
 																		&found);
 
@@ -426,7 +475,7 @@ ash_shmem_startup(void)
 
 		/* Initialize pointers. */
 		buffer = ProcCmdTypeBuffer;
-		for (i = 0; i < get_max_procs_count(); i++)
+		for (i = 0; i < proc_entry_count; i++)
 		{
 			ProcEntryArray[i].cmdtype= buffer;
 			buffer += NAMEDATALEN;
@@ -729,7 +778,8 @@ ash_entry_store(TimestampTz ash_time, const int pid,
 				const char *backend_type, Oid usesysid,
 				TransactionId backend_xid, int blockers, int blockerpid,
 				const char *blocker_state, uint64 queryid,
-				const char *gpi_query, const char *cmdtype)
+				uint64 nested_queryid, const char *gpi_query,
+				const char *cmdtype)
 {
 	int inserted;
 	inserted=IntEntryArray[0].inserted-1;
@@ -776,6 +826,7 @@ ash_entry_store(TimestampTz ash_time, const int pid,
 	AshEntryArray[inserted].blockers=blockers;
 	AshEntryArray[inserted].blockerpid=blockerpid;
 	AshEntryArray[inserted].queryid=queryid;
+	AshEntryArray[inserted].nested_queryid=nested_queryid;
 }
 
 static void
@@ -794,7 +845,8 @@ ash_prepare_store(TimestampTz ash_time, const int pid,
 					const char *backend_type, Oid usesysid,
 					TransactionId backend_xid, int blockers, int blockerpid,
 					const char *blocker_state, uint64 queryid,
-					const char *gpi_query, const char *cmdtype)
+					uint64 nested_queryid, const char *gpi_query,
+					const char *cmdtype)
 {
 	/* Safety check... */
 	if (!AshEntryArray) { return; }
@@ -809,7 +861,7 @@ ash_prepare_store(TimestampTz ash_time, const int pid,
 					xact_start, query_start, state_change, wait_event_type,
 					wait_event, state, client_hostname, query, backend_type,
 					usesysid, backend_xid, blockers, blockerpid, blocker_state,
-					queryid, gpi_query, cmdtype);
+					queryid, nested_queryid, gpi_query, cmdtype);
 }
 
 /*
@@ -948,14 +1000,17 @@ ash_state_of_pid(ashActivityRow *rows, int nrows, int pid)
 /*
  * Look up the parsed query/cmdtype/queryid the extension recorded for a pid in
  * its own ProcEntryArray (populated by the post_parse_analyze hook).  This is
- * extension-owned data, indexed the same way get_parsedinfo() indexes it.
+ * extension-owned data, indexed the same way get_parsedinfo() indexes it, and
+ * bounded the same way: never read past the slots ProcEntryArray was sized for.
  */
 static procEntry *
 ash_proc_entry_of_pid(int pid)
 {
+	uint32		nprocs = Min(ProcGlobal->allProcCount,
+							 (uint32) proc_entry_count);
 	int			i;
 
-	for (i = 0; i < (int) ProcGlobal->allProcCount; i++)
+	for (i = 0; i < (int) nprocs; i++)
 		if (ProcGlobal->allProcs[i].pid == pid)
 			return &ProcEntryArray[i];
 	return NULL;
@@ -1222,6 +1277,7 @@ ash_collect_sample(TimestampTz ash_time, bool track_idle, bool *gotactives)
 		const char *gpi_query = "";
 		const char *cmdtype = "";
 		uint64		queryid;
+		uint64		nested_queryid;
 
 		if (row->pid <= 0 || row->pid == my_pid)
 			continue;
@@ -1235,9 +1291,17 @@ ash_collect_sample(TimestampTz ash_time, bool track_idle, bool *gotactives)
 		blocker_state = ash_state_of_pid(rows, nrows, blocker_pid);
 
 		pe = ash_proc_entry_of_pid(row->pid);
-		queryid = (pe != NULL) ? pe->queryid : 0;
-		if (row->query_id != 0)
-			queryid = row->query_id;
+
+		/*
+		 * nested_queryid is what our parse hook recorded for the statement
+		 * the backend is executing right now, which may be nested inside a
+		 * function.  queryid is the top-level statement's id from
+		 * pg_stat_activity; without one (before PG 14, or with
+		 * compute_query_id = off) fall back to the hook's value.
+		 */
+		nested_queryid = (pe != NULL) ? pe->queryid : 0;
+		queryid = (row->query_id != 0) ? row->query_id : nested_queryid;
+
 		if (pe != NULL)
 		{
 			if (pe->query != NULL && pe->query[0] != '\0')
@@ -1280,6 +1344,7 @@ ash_collect_sample(TimestampTz ash_time, bool track_idle, bool *gotactives)
 						  blocker_pid,
 						  blocker_state,
 						  queryid,
+						  nested_queryid,
 						  gpi_query,
 						  cmdtype);
 	}
@@ -1293,6 +1358,7 @@ pgsentinel_main(Datum main_arg)
 {
 	MemoryContext pgsentinel_loop_context;
 	MemoryContext saved_context;
+	bool collect_pgssh_on_idle = false;
 
 	ereport(LOG, (errmsg("starting bgworker pgsentinel")));
 
@@ -1311,6 +1377,13 @@ pgsentinel_main(Datum main_arg)
 	BackgroundWorkerInitializeConnection(pgsentinelDbName, NULL, 0);
 #endif
 
+	/*
+	 * The queries run as superuser, so don't let search_path pick the
+	 * objects they use: search pg_catalog only, and schema-qualify our own
+	 * objects and those of pg_stat_statements.
+	 */
+	SetConfigOption("search_path", "", PGC_SUSET, PGC_S_OVERRIDE);
+
 	pgsentinel_loop_context = AllocSetContextCreate(TopMemoryContext,
 													"pgsentinel loop context",
 													ALLOCSET_DEFAULT_SIZES);
@@ -1322,7 +1395,11 @@ pgsentinel_main(Datum main_arg)
 		int rc, ret;
 		uint64 i;
 		bool gotactives;
+		bool collect_pgssh;
 		TimestampTz ash_time;
+		const char *ash_schema;
+		const char *pgss_schema;
+		char *query;
 		gotactives=false; 
 
 letswait:
@@ -1363,7 +1440,23 @@ letswait:
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		if (!PgSentinelHasBeenLoaded()) {
+		SPI_connect();
+
+		ash_schema = NULL;
+		pgss_schema = NULL;
+
+		if (PgSentinelHasBeenLoaded())
+		{
+			ash_schema = quoted_extension_schema(EXTENSION_NAME,
+												 pgsentinel_loop_context);
+			/* Look it up now, so pgssh collection is skipped without it */
+			if (pgssh_enable)
+				pgss_schema = quoted_extension_schema("pg_stat_statements",
+													  pgsentinel_loop_context);
+		}
+
+		if (ash_schema == NULL) {
+			SPI_finish();
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 			MemoryContextReset(pgsentinel_loop_context);
@@ -1379,21 +1472,28 @@ letswait:
 							   "pgsentinel: collecting ASH sample");
 		ash_time = GetCurrentTimestamp();
 		ash_collect_sample(ash_time, ash_track_idle_trans, &gotactives);
+		SPI_finish();
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		pgstat_report_activity(STATE_IDLE, NULL);
 
 		/* pg_stat_statement_history */
-		if (gotactives && pgssh_enable)
+		collect_pgssh = gotactives || collect_pgssh_on_idle;
+		/* Remember active sessions so pg_stat_statement_history is collected once on the following idle cycle. */
+		collect_pgssh_on_idle = gotactives;
+
+		if (collect_pgssh && pgssh_enable && pgss_schema != NULL)
 		{
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();
 			SPI_connect();
 			PushActiveSnapshot(GetTransactionSnapshot());
-			pgstat_report_activity(STATE_RUNNING, pg_stat_statements_query);
+
+			query = psprintf(pg_stat_statements_query, pgss_schema, ash_schema);
+			pgstat_report_activity(STATE_RUNNING, query);
 
 			/* We can now execute queries via SPI */
-			ret = SPI_execute(pg_stat_statements_query,true, 0);
+			ret = SPI_execute(query, true, 0);
 
 			if (ret != SPI_OK_SELECT)
 				elog(FATAL, "cannot select from pg_stat_statements: error code %d", ret);
@@ -1812,6 +1912,12 @@ pg_active_session_history_internal(FunctionCallInfo fcinfo)
 			nulls[j++] = true;
 		}
 
+		// nested_queryid - apply privilege check
+		if (show_text && AshEntryArray[i].nested_queryid)
+			values[j++] = Int64GetDatum(AshEntryArray[i].nested_queryid);
+		else
+			nulls[j++] = true;
+
 
 		// backend_type
 		if (AshEntryArray[i].backend_type[0] != '\0')
@@ -2143,4 +2249,27 @@ ash_shmem_request(void)
 		RequestAddinShmemSpace(pgssh_entry_memsize());
 		RequestNamedLWLockTranche("Pgssh Entry Array", 1);
 	}
+}
+
+/*
+ * Return the quoted name of the schema extension extname is installed in,
+ * allocated in mcxt, or NULL if it is not installed.  The caller must be
+ * connected to SPI.
+ */
+static char *
+quoted_extension_schema(const char *extname, MemoryContext mcxt)
+{
+	Oid			argtypes[1] = {TEXTOID};
+	Datum		values[1];
+
+	values[0] = CStringGetTextDatum(extname);
+	if (SPI_execute_with_args(extension_schema_query, 1, argtypes, values,
+							  NULL, true, 1) != SPI_OK_SELECT)
+		elog(FATAL, "cannot look up the schema of extension \"%s\"", extname);
+
+	if (SPI_processed == 0)
+		return NULL;
+
+	return MemoryContextStrdup(mcxt, SPI_getvalue(SPI_tuptable->vals[0],
+												  SPI_tuptable->tupdesc, 1));
 }

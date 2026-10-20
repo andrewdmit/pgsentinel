@@ -1,7 +1,73 @@
 CREATE EXTENSION pg_stat_statements;
 CREATE EXTENSION pgsentinel;
+SET pg_stat_statements.track = 'all';
 select pg_sleep(3);
 select count(*) > 0 AS has_data from pg_active_session_history where queryid in (select queryid from pg_stat_statements);
+
+CREATE FUNCTION pgsentinel_nested_queryid_test() RETURNS void AS $$
+BEGIN
+  PERFORM pg_sleep(4);
+END;
+$$ LANGUAGE plpgsql;
+SELECT pgsentinel_nested_queryid_test();
+
+-- Verify ASH records a distinct nested query ID.
+SELECT CASE WHEN current_setting('server_version_num')::integer >= 160000
+       THEN count(*) > 0 ELSE true END AS has_nested_queryid
+FROM pg_active_session_history
+WHERE nested_queryid IS NOT NULL AND nested_queryid <> queryid;
+SELECT pgsentinel_nested_queryid_test();
+
+-- Verify pgssh includes both top-level and nested query IDs.
+SELECT CASE WHEN current_setting('server_version_num')::integer >= 160000
+       THEN count(DISTINCT h.queryid) = 2 ELSE true END
+       AS has_nested_pgssh_queryids
+FROM pg_stat_statements_history AS h
+WHERE h.queryid IN (
+  SELECT queryid
+  FROM pg_active_session_history
+  WHERE top_level_query LIKE 'SELECT pgsentinel_nested_queryid_test()%'
+  UNION
+  SELECT nested_queryid
+  FROM pg_active_session_history
+  WHERE top_level_query LIKE 'SELECT pgsentinel_nested_queryid_test()%'
+);
+DROP FUNCTION pgsentinel_nested_queryid_test();
+
+select pg_sleep(3);
+select count(*) > 0 AS has_pgssh_data from pg_stat_statements_history;
+select 'test2' test2, pg_sleep(3);
+select 'test2' test2, pg_sleep(3);
+-- Elicit a few seconds where pgsentinel collection is idle.
+\! sleep 2
+
+-- Exercise pgssh's limit 2 path when the query disappears from ASH while collection is not idle.
+with ash as (
+	select queryid, max(ash_time) as max_ash_time
+	from pg_active_session_history
+	where query like 'select pg_sleep(3)%'
+	group by queryid
+), pgssh as (
+	select queryid, max(ash_time) as max_ash_time
+	from pg_stat_statements_history
+	group by queryid
+)
+select pgssh.max_ash_time > ash.max_ash_time as pgssh_after_ash
+from ash join pgssh using (queryid);
+
+-- Exercise pgssh's collect_pgssh_on_idle path when the query disappears from ASH while collection is idle.
+with ash as (
+	select queryid, max(ash_time) as max_ash_time
+	from pg_active_session_history
+	where query like 'select ''test2'' test2, pg_sleep(3)%'
+	group by queryid
+), pgssh as (
+	select queryid, max(ash_time) as max_ash_time
+	from pg_stat_statements_history
+	group by queryid
+)
+select pgssh.max_ash_time > ash.max_ash_time as pgssh_after_ash
+from ash join pgssh using (queryid);
 
 begin;
 \! sleep 3
@@ -18,6 +84,17 @@ commit;
 
 select count(*) > 0 AS has_idle_data from pg_active_session_history where state  = 'idle in transaction';
 
+-- The worker keeps sampling when search_path doesn't include pgsentinel's schema
+SET search_path = "$user", public;  -- this session keeps its own
+ALTER SYSTEM SET search_path = 'pg_catalog';
+select pg_reload_conf();
+SELECT pg_sleep(3), 'pg_catalog only';
+SELECT count(*) > 0 AS has_data_without_public
+FROM pg_active_session_history
+WHERE top_level_query LIKE 'SELECT pg_sleep(3), ''pg_catalog only''%';
+ALTER SYSTEM RESET search_path;
+select pg_reload_conf();
+
 -- Test privilege check
 CREATE ROLE test_unprivileged LOGIN;
 
@@ -28,6 +105,25 @@ FROM pg_active_session_history;
 RESET ROLE;
 
 DROP ROLE test_unprivileged;
+
+-- Test get_parsedinfo() privileges
+CREATE ROLE test_gpi_unprivileged;
+
+-- PUBLIC can't execute it
+SELECT has_function_privilege('test_gpi_unprivileged', 'get_parsedinfo(int)', 'EXECUTE')
+       AS unprivileged_can_execute;
+SET ROLE test_gpi_unprivileged;
+SELECT count(*) FROM get_parsedinfo(-1);
+RESET ROLE;
+
+-- A role granted EXECUTE can run it
+GRANT EXECUTE ON FUNCTION get_parsedinfo(int) TO test_gpi_unprivileged;
+SET ROLE test_gpi_unprivileged;
+SELECT count(*) > 0 AS granted_can_execute FROM get_parsedinfo(-1);
+RESET ROLE;
+
+REVOKE EXECUTE ON FUNCTION get_parsedinfo(int) FROM test_gpi_unprivileged;
+DROP ROLE test_gpi_unprivileged;
 
 DROP EXTENSION pgsentinel;
 DROP EXTENSION pg_stat_statements;

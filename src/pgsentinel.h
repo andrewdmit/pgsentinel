@@ -41,5 +41,6 @@ typedef struct procEntry
 } procEntry;
 
 extern procEntry *ProcEntryArray;
+extern int proc_entry_count;
 
 #endif
