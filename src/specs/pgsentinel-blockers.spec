@@ -12,7 +12,7 @@
 
 setup
 {
-    CREATE EXTENSION IF NOT EXISTS pgsentinel;
+    CREATE EXTENSION IF NOT EXISTS pgsentinel_nx;
     CREATE TABLE ash_lock_target (id int);
     INSERT INTO ash_lock_target VALUES (1);
 
@@ -53,7 +53,7 @@ setup
             PERFORM pg_sleep(0.1);
         END LOOP;
         IF NOT sampled THEN
-            RAISE EXCEPTION 'pgsentinel recorded no sample of the blocked session within 60 seconds';
+            RAISE EXCEPTION 'pgsentinel_nx recorded no sample of the blocked session within 60 seconds';
         END IF;
 
         -- Any NULL here is a failure, hence coalesce over a single AND chain.
@@ -85,7 +85,7 @@ teardown
 {
     DROP FUNCTION ash_check_blocked(int, text, text);
     DROP TABLE ash_lock_target;
-    DROP EXTENSION pgsentinel;
+    DROP EXTENSION pgsentinel_nx;
 }
 
 session holder1

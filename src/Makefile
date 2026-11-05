@@ -16,7 +16,7 @@ endif
 REGRESS = pgsentinel-upgrade-test pgsentinel-test
 ISOLATION = pgsentinel-blockers
 
-MODULE_big = pgsentinel
+MODULE_big = pgsentinel_nx
 OBJS = $(patsubst %.c,%.o,$(wildcard ./*.c))
 
 ifeq ($(CC),gcc)
@@ -27,9 +27,9 @@ endif
 
 EXTRA_CLEAN += $(addprefix ./,*.gcno *.gcda)
 
-EXTENSION = pgsentinel
+EXTENSION = pgsentinel_nx
 DATA = $(wildcard $(EXTENSION)*--*.sql)
-PGFILEDESC = "pgsentinel - active session history"
+PGFILEDESC = "pgsentinel_nx - active session history"
 
 LDFLAGS_SL += $(filter -lm, $(LIBS))
 

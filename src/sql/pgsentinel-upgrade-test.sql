@@ -1,5 +1,5 @@
 CREATE EXTENSION pg_stat_statements;
-CREATE EXTENSION pgsentinel VERSION '1.4.1';
+CREATE EXTENSION pgsentinel_nx VERSION '1.4.1';
 SET pg_stat_statements.track = 'all';
 
 SELECT pg_sleep(3);
@@ -12,11 +12,11 @@ SELECT prosrc
 FROM pg_proc
 WHERE oid = 'pg_active_session_history()'::regprocedure;
 
-ALTER EXTENSION pgsentinel UPDATE TO '1.5.1';
+ALTER EXTENSION pgsentinel_nx UPDATE TO '1.5.1';
 
 SELECT extversion
 FROM pg_extension
-WHERE extname = 'pgsentinel';
+WHERE extname = 'pgsentinel_nx';
 SELECT prosrc
 FROM pg_proc
 WHERE oid = 'pg_active_session_history()'::regprocedure;
@@ -26,11 +26,11 @@ FROM pg_active_session_history;
 CREATE VIEW pgsentinel_ash_dependency AS
 SELECT * FROM pg_active_session_history;
 
-ALTER EXTENSION pgsentinel UPDATE;
+ALTER EXTENSION pgsentinel_nx UPDATE;
 
 SELECT extversion
 FROM pg_extension
-WHERE extname = 'pgsentinel';
+WHERE extname = 'pgsentinel_nx';
 SELECT prosrc
 FROM pg_proc
 WHERE oid = 'pg_active_session_history()'::regprocedure;
@@ -41,5 +41,5 @@ WHERE attrelid = 'pg_active_session_history'::regclass
   AND NOT attisdropped;
 
 DROP VIEW pgsentinel_ash_dependency;
-DROP EXTENSION pgsentinel;
+DROP EXTENSION pgsentinel_nx;
 DROP EXTENSION pg_stat_statements;

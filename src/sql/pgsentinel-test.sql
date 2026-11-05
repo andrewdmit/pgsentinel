@@ -1,5 +1,5 @@
 CREATE EXTENSION pg_stat_statements;
-CREATE EXTENSION pgsentinel;
+CREATE EXTENSION pgsentinel_nx;
 SET pg_stat_statements.track = 'all';
 select pg_sleep(3);
 select count(*) > 0 AS has_data from pg_active_session_history where queryid in (select queryid from pg_stat_statements);
@@ -38,7 +38,7 @@ select pg_sleep(3);
 select count(*) > 0 AS has_pgssh_data from pg_stat_statements_history;
 select 'test2' test2, pg_sleep(3);
 select 'test2' test2, pg_sleep(3);
--- Elicit a few seconds where pgsentinel collection is idle.
+-- Elicit a few seconds where pgsentinel_nx collection is idle.
 \! sleep 2
 
 -- Exercise pgssh's limit 2 path when the query disappears from ASH while collection is not idle.
@@ -75,7 +75,7 @@ commit;
 
 select count(*) > 0 AS has_idle_data from pg_active_session_history where state  = 'idle in transaction';
 
-ALTER SYSTEM SET pgsentinel_ash.track_idle_trans = true;
+ALTER SYSTEM SET pgsentinel_nx_ash.track_idle_trans = true;
 select pg_reload_conf();
 
 begin;
@@ -84,7 +84,7 @@ commit;
 
 select count(*) > 0 AS has_idle_data from pg_active_session_history where state  = 'idle in transaction';
 
--- The worker keeps sampling when search_path doesn't include pgsentinel's schema
+-- The worker keeps sampling when search_path doesn't include pgsentinel_nx's schema
 SET search_path = "$user", public;  -- this session keeps its own
 ALTER SYSTEM SET search_path = 'pg_catalog';
 select pg_reload_conf();
@@ -125,5 +125,5 @@ RESET ROLE;
 REVOKE EXECUTE ON FUNCTION get_parsedinfo(int) FROM test_gpi_unprivileged;
 DROP ROLE test_gpi_unprivileged;
 
-DROP EXTENSION pgsentinel;
+DROP EXTENSION pgsentinel_nx;
 DROP EXTENSION pg_stat_statements;

@@ -1,9 +1,11 @@
-/* pgsentinel--1.5.1--1.5.2.sql */
+/* pgsentinel_nx--1.4.1--1.5.0.sql */
 
--- complain if script is sourced in psql, rather than via ALTER EXTENSION
-\echo Use "ALTER EXTENSION pgsentinel UPDATE TO '1.5.2'" to load this file. \quit
+\echo Use "ALTER EXTENSION pgsentinel_nx UPDATE TO '1.5.0'" to load this file. \quit
 
-CREATE OR REPLACE FUNCTION pg_active_session_history(
+DROP VIEW pg_active_session_history;
+DROP FUNCTION pg_active_session_history();
+
+CREATE FUNCTION pg_active_session_history(
     OUT ash_time timestamptz, OUT datid Oid, OUT datname text,
     OUT pid integer, OUT leader_pid integer, OUT usesysid Oid,
     OUT usename text, OUT application_name text, OUT client_addr text,
@@ -16,5 +18,10 @@ CREATE OR REPLACE FUNCTION pg_active_session_history(
     OUT nested_queryid bigint, OUT backend_type text, OUT blockers integer,
     OUT blockerpid integer, OUT blocker_state text)
 RETURNS SETOF record
-AS 'MODULE_PATHNAME', 'pg_active_session_history_1_5'
+AS 'MODULE_PATHNAME', 'pg_active_session_history'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+CREATE VIEW pg_active_session_history AS
+  SELECT * FROM pg_active_session_history();
+
+GRANT SELECT ON pg_active_session_history TO PUBLIC;

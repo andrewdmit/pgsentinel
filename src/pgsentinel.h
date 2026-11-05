@@ -9,6 +9,24 @@
         #error "You are trying to build pg_sentinel with PostgreSQL version < 9.6"
 #endif
 
+/*
+ * This build is pgsentinel_nx, meant to be loadable next to vanilla
+ * pgsentinel.  Before PostgreSQL 16 modules are not built with hidden
+ * visibility, and libraries are dlopen()ed with RTLD_GLOBAL, so a global
+ * symbol shared between our source files would bind to the copy in whichever
+ * library was loaded first: we would write into vanilla's ProcEntryArray, and
+ * saving our hook into its prev_post_parse_analyze_hook would make its hook
+ * call itself.  Give every such symbol a name of its own.  (Entry points that
+ * PostgreSQL looks up in a specific library, such as _PG_init and the SQL
+ * functions, can keep theirs.)
+ */
+#define ProcEntryArray						ProcEntryArray_nx
+#define proc_entry_count					proc_entry_count_nx
+#define prev_post_parse_analyze_hook		prev_post_parse_analyze_hook_nx
+#define getparsedinfo_post_parse_analyze	getparsedinfo_post_parse_analyze_nx
+#define get_max_procs_count					get_max_procs_count_nx
+#define proc_entry_memsize					proc_entry_memsize_nx
+
 /* Saved hook values in case of unload */
 extern post_parse_analyze_hook_type prev_post_parse_analyze_hook;
 

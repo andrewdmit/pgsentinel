@@ -94,7 +94,7 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_history);
 #define PG_ACTIVE_SESSION_HISTORY_COLS_V1_5   29
 #define PG_ACTIVE_SESSION_HISTORY_COLS        29
 #define PG_STAT_STATEMENTS_HISTORY_COLS       24
-#define EXTENSION_NAME "pgsentinel"
+#define EXTENSION_NAME "pgsentinel_nx"
 
 /*
  * Active session history API version, for supporting older extension objects.
@@ -135,7 +135,7 @@ static int ash_restart_wait_time = 2;
 static char *pgsentinelDbName = "postgres";
 
 /* Worker name */
-static char *worker_name = "pgsentinel";
+static char *worker_name = "pgsentinel_nx";
 
 
 /* Query IDs exposed by extension versions before 1.5. */
@@ -419,14 +419,14 @@ ash_shmem_startup(void)
 		ash_prev_shmem_startup_hook();
 
 	size = mul_size(sizeof(ashEntry), ash_max_entries);
-	AshEntryArray = (ashEntry *) ShmemInitStruct("Ash Entry Array", size,
+	AshEntryArray = (ashEntry *) ShmemInitStruct("pgsentinel_nx Ash Entry Array", size,
 																		&found);
 
 	if (!found)
 		MemSet(AshEntryArray, 0, size);
 
 	size = mul_size(sizeof(intEntry), 1);
-	IntEntryArray = (intEntry *) ShmemInitStruct("int Entry Array", size,
+	IntEntryArray = (intEntry *) ShmemInitStruct("pgsentinel_nx int Entry Array", size,
 																		&found);
 
 	if (!found)
@@ -439,7 +439,7 @@ ash_shmem_startup(void)
 	if (pgssh_enable)
 	{
 		size = mul_size(sizeof(pgsshEntry), pgssh_max_entries);
-		PgsshEntryArray = (pgsshEntry *) ShmemInitStruct("pgssh Entry Array",
+		PgsshEntryArray = (pgsshEntry *) ShmemInitStruct("pgsentinel_nx pgssh Entry Array",
 																size, &found);
 
 		if (!found)
@@ -454,12 +454,12 @@ ash_shmem_startup(void)
 	 * hard in assert builds so the mismatch is caught in development.
 	 */
 	if ((uint32) proc_entry_count != ProcGlobal->allProcCount)
-		elog(WARNING, "pgsentinel: ProcEntryArray has %d entries but ProcGlobal->allProcCount is %u",
+		elog(WARNING, "pgsentinel_nx: ProcEntryArray has %d entries but ProcGlobal->allProcCount is %u",
 			 proc_entry_count, ProcGlobal->allProcCount);
 	Assert((uint32) proc_entry_count == ProcGlobal->allProcCount);
 
 	size = mul_size(sizeof(procEntry), proc_entry_count);
-	ProcEntryArray = (procEntry *) ShmemInitStruct("Get_parsedinfo Proc Entry",
+	ProcEntryArray = (procEntry *) ShmemInitStruct("pgsentinel_nx Get_parsedinfo Proc Entry",
 																size, &found);
 
 	if (!found)
@@ -468,7 +468,7 @@ ash_shmem_startup(void)
 	}
 
 	size = mul_size(pgstat_track_activity_query_size, proc_entry_count);
-	ProcQueryBuffer = (char *) ShmemInitStruct("Proc Query Buffer", size,
+	ProcQueryBuffer = (char *) ShmemInitStruct("pgsentinel_nx Proc Query Buffer", size,
 																	&found);
 
 	if (!found)
@@ -485,7 +485,7 @@ ash_shmem_startup(void)
 	}
 
 	size = mul_size(NAMEDATALEN, proc_entry_count);
-	ProcCmdTypeBuffer = (char *) ShmemInitStruct("Proc CmdType Buffer", size,
+	ProcCmdTypeBuffer = (char *) ShmemInitStruct("pgsentinel_nx Proc CmdType Buffer", size,
 																		&found);
 
 	if (!found)
@@ -503,7 +503,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryUsenameBuffer = (char *)
-		ShmemInitStruct("Ash Entry useName Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry useName Buffer", size, &found);
 
 	if (!found)
 	{
@@ -521,7 +521,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryDatnameBuffer = (char *)
-		ShmemInitStruct("Ash Entry DatName Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry DatName Buffer", size, &found);
 
 	if (!found)
 	{
@@ -539,7 +539,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryAppnameBuffer = (char *)
-		ShmemInitStruct("Ash Entry AppName Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry AppName Buffer", size, &found);
 
 	if (!found)
 	{
@@ -556,7 +556,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryClientaddrBuffer = (char *)
-		ShmemInitStruct("Ash Entry Client Addr Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry Client Addr Buffer", size, &found);
 
 	if (!found)
 	{
@@ -573,7 +573,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryWaitEventTypeBuffer = (char *)
-		ShmemInitStruct("Ash Entry Wait event type Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry Wait event type Buffer", size, &found);
 
 	if (!found)
 	{
@@ -590,7 +590,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryWaitEventBuffer = (char *)
-		ShmemInitStruct("Ash Entry Wait Event Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry Wait Event Buffer", size, &found);
 
 	if (!found)
 	{
@@ -608,7 +608,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryStateBuffer = (char *)
-		ShmemInitStruct("Ash Entry State Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry State Buffer", size, &found);
 
 	if (!found)
 	{
@@ -625,7 +625,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryClientHostnameBuffer = (char *)
-		ShmemInitStruct("Ash Entry Client Hostname Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry Client Hostname Buffer", size, &found);
 
 	if (!found)
 	{
@@ -642,7 +642,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(pgstat_track_activity_query_size, ash_max_entries);
 	AshEntryTopLevelQueryBuffer = (char *)
-		ShmemInitStruct("Ash Entry Top Level Query Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry Top Level Query Buffer", size, &found);
 
 	if (!found)
 	{
@@ -659,7 +659,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(pgstat_track_activity_query_size, ash_max_entries);
 	AshEntryQueryBuffer = (char *)
-		ShmemInitStruct("Ash Entry Query Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry Query Buffer", size, &found);
 
 	if (!found)
 	{
@@ -676,7 +676,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryCmdTypeBuffer = (char *)
-		ShmemInitStruct("Ash Entry CmdType Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry CmdType Buffer", size, &found);
 
 	if (!found)
 	{
@@ -694,7 +694,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryBackendTypeBuffer = (char *)
-		ShmemInitStruct("Ash Entry Backend Type Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry Backend Type Buffer", size, &found);
 
 	if (!found)
 	{
@@ -711,7 +711,7 @@ ash_shmem_startup(void)
 
 	size = mul_size(NAMEDATALEN, ash_max_entries);
 	AshEntryBlockerStateBuffer = (char *)
-		ShmemInitStruct("Ash Entry Blocker State Buffer", size, &found);
+		ShmemInitStruct("pgsentinel_nx Ash Entry Blocker State Buffer", size, &found);
 
 	if (!found)
 	{
@@ -954,7 +954,7 @@ ash_require_activity_attno(int attno, const char *name)
 {
 	if (attno <= 0)
 		elog(FATAL,
-			 "pgsentinel: pg_stat_get_activity() has no \"%s\" column", name);
+			 "pgsentinel_nx: pg_stat_get_activity() has no \"%s\" column", name);
 }
 
 /* Read a text column, returning def when the attribute is missing or NULL. */
@@ -1379,7 +1379,7 @@ pgsentinel_main(Datum main_arg)
 	MemoryContext saved_context;
 	bool collect_pgssh_on_idle = false;
 
-	ereport(LOG, (errmsg("starting bgworker pgsentinel")));
+	ereport(LOG, (errmsg("starting bgworker pgsentinel_nx")));
 
 	/* Register functions for SIGTERM/SIGHUP management */
 	pqsignal(SIGHUP, pgsentinel_sighup);
@@ -1404,7 +1404,7 @@ pgsentinel_main(Datum main_arg)
 	SetConfigOption("search_path", "", PGC_SUSET, PGC_S_OVERRIDE);
 
 	pgsentinel_loop_context = AllocSetContextCreate(TopMemoryContext,
-													"pgsentinel loop context",
+													"pgsentinel_nx loop context",
 													ALLOCSET_DEFAULT_SIZES);
 
 	saved_context = MemoryContextSwitchTo(pgsentinel_loop_context);
@@ -1447,13 +1447,13 @@ letswait:
 			/* Process config file */
 			got_sighup = false;
 			ProcessConfigFile(PGC_SIGHUP);
-			ereport(LOG, (errmsg("bgworker pgsentinel signal: processed SIGHUP")));
+			ereport(LOG, (errmsg("bgworker pgsentinel_nx signal: processed SIGHUP")));
 		}
 
 		if (got_sigterm)
 		{
 			/* Simply exit */
-			ereport(LOG, (errmsg("bgworker pgsentinel signal: processed SIGTERM")));
+			ereport(LOG, (errmsg("bgworker pgsentinel_nx signal: processed SIGTERM")));
 			proc_exit(0);
 		}
 
@@ -1492,7 +1492,7 @@ letswait:
 		 * parsed or planned, we just consume what those functions return.
 		 */
 		pgstat_report_activity(STATE_RUNNING,
-							   "pgsentinel: collecting ASH sample");
+							   "pgsentinel_nx: collecting ASH sample");
 		ash_time = GetCurrentTimestamp();
 		ash_collect_sample(ash_time, ash_track_idle_trans, &gotactives);
 		SPI_finish();
@@ -1580,7 +1580,7 @@ static void
 pgsentinel_load_params(void)
 {
 
-	DefineCustomIntVariable("pgsentinel_ash.sampling_period",
+	DefineCustomIntVariable("pgsentinel_nx_ash.sampling_period",
 							"Duration between each pull (in seconds).",
 							NULL,
 							&ash_sampling_period,
@@ -1593,7 +1593,7 @@ pgsentinel_load_params(void)
 							NULL,
 							NULL);
 
-	DefineCustomBoolVariable("pgsentinel_ash.track_idle_trans",
+	DefineCustomBoolVariable("pgsentinel_nx_ash.track_idle_trans",
 	                        "Track session in idle transaction state.",
 							NULL,
 							&ash_track_idle_trans,
@@ -1608,7 +1608,7 @@ pgsentinel_load_params(void)
 		return;
 
 	/* can't define PGC_POSTMASTER variable after startup */
-	DefineCustomIntVariable("pgsentinel_ash.max_entries",
+	DefineCustomIntVariable("pgsentinel_nx_ash.max_entries",
 							"Maximum number of ash entries.",
 							NULL,
 							&ash_max_entries,
@@ -1621,9 +1621,9 @@ pgsentinel_load_params(void)
 							NULL,
 							NULL);
 
-	EmitWarningsOnPlaceholders("pgsentinel_ash");
+	EmitWarningsOnPlaceholders("pgsentinel_nx_ash");
 
-	DefineCustomIntVariable("pgsentinel_pgssh.max_entries",
+	DefineCustomIntVariable("pgsentinel_nx_pgssh.max_entries",
 							"Maximum number of pgssh entries.",
 							NULL,
 							&pgssh_max_entries,
@@ -1636,7 +1636,7 @@ pgsentinel_load_params(void)
 							NULL,
 							NULL);
 
-	DefineCustomBoolVariable("pgsentinel_pgssh.enable",
+	DefineCustomBoolVariable("pgsentinel_nx_pgssh.enable",
 	                        "Enable pg_stat_statements_history.",
 							NULL,
 							&pgssh_enable,
@@ -1647,9 +1647,9 @@ pgsentinel_load_params(void)
 							NULL,
 							NULL);
 
-	EmitWarningsOnPlaceholders("pgsentinel_pgssh");
+	EmitWarningsOnPlaceholders("pgsentinel_nx_pgssh");
 
-	DefineCustomStringVariable("pgsentinel.db_name",
+	DefineCustomStringVariable("pgsentinel_nx.db_name",
 							gettext_noop("Database on which the worker connect."),
 							NULL,
 							&pgsentinelDbName,
@@ -1699,7 +1699,7 @@ _PG_init(void)
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 #if PG_VERSION_NUM >= 100000
-	sprintf(worker.bgw_library_name, "pgsentinel");
+	sprintf(worker.bgw_library_name, "pgsentinel_nx");
 	sprintf(worker.bgw_function_name, "pgsentinel_main");
 #else
 	worker.bgw_main = pgsentinel_main;
@@ -2003,7 +2003,7 @@ pg_stat_statements_history_internal(FunctionCallInfo fcinfo)
 	if (!pgssh_enable)
 		ereport(ERROR,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("pg_stat_statements_history not enabled, set pgsentinel_pgssh.enable")));
+				errmsg("pg_stat_statements_history not enabled, set pgsentinel_nx_pgssh.enable")));
 	/* Entry array must exist already */
 	if (!PgsshEntryArray)
 		ereport(ERROR,
@@ -2338,18 +2338,18 @@ ash_shmem_request(void)
 		ash_prev_shmem_request_hook();
 #endif
 	RequestAddinShmemSpace(ash_entry_memsize());
-	RequestNamedLWLockTranche("Ash Entry Array", 1);
+	RequestNamedLWLockTranche("pgsentinel_nx Ash Entry Array", 1);
 
 	RequestAddinShmemSpace(proc_entry_memsize());
-	RequestNamedLWLockTranche("Get_parsedinfo Proc Entry Array", 1);
+	RequestNamedLWLockTranche("pgsentinel_nx Get_parsedinfo Proc Entry Array", 1);
 
 	RequestAddinShmemSpace(int_entry_memsize());
-	RequestNamedLWLockTranche("Int Entry Array", 1);
+	RequestNamedLWLockTranche("pgsentinel_nx Int Entry Array", 1);
 
 	if (pgssh_enable)
 	{
 		RequestAddinShmemSpace(pgssh_entry_memsize());
-		RequestNamedLWLockTranche("Pgssh Entry Array", 1);
+		RequestNamedLWLockTranche("pgsentinel_nx Pgssh Entry Array", 1);
 	}
 }
 
