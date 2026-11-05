@@ -13,7 +13,7 @@ else
     ISOLATION_OPTS = --temp-config=./$(PGSENTINEL_CONF) --temp-instance=./tmp_check_iso
 endif
 
-REGRESS = pgsentinel-test pgsentinel-upgrade-test
+REGRESS = pgsentinel-upgrade-test pgsentinel-test
 ISOLATION = pgsentinel-blockers
 
 MODULE_big = pgsentinel

@@ -87,11 +87,23 @@
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_active_session_history);
+PG_FUNCTION_INFO_V1(pg_active_session_history_1_5);
 PG_FUNCTION_INFO_V1(pg_stat_statements_history);
 
+#define PG_ACTIVE_SESSION_HISTORY_COLS_V1_0   28
+#define PG_ACTIVE_SESSION_HISTORY_COLS_V1_5   29
 #define PG_ACTIVE_SESSION_HISTORY_COLS        29
 #define PG_STAT_STATEMENTS_HISTORY_COLS       24
 #define EXTENSION_NAME "pgsentinel"
+
+/*
+ * Active session history API version, for supporting older extension objects.
+ */
+typedef enum pgashVersion
+{
+	PGASH_V1_0 = 0,
+	PGASH_V1_5,
+} pgashVersion;
 
 /* Entry point of library loading */
 void _PG_init(void);
@@ -126,9 +138,24 @@ static char *pgsentinelDbName = "postgres";
 static char *worker_name = "pgsentinel";
 
 
+/* Query IDs exposed by extension versions before 1.5. */
+static const char *const pg_stat_statements_queryids_v1_0 =
+"select queryid from %s.pg_active_session_history \
+ where ash_time in (select ash_time from %s.pg_active_session_history \
+ order by ash_time desc limit 2)";
+
+/* Query IDs exposed by extension version 1.5 and later. */
+static const char *const pg_stat_statements_queryids_v1_5 =
+"select queryid from %s.pg_active_session_history \
+ where ash_time in (select ash_time from %s.pg_active_session_history \
+ order by ash_time desc limit 2) \
+ union select nested_queryid from %s.pg_active_session_history \
+ where ash_time in (select ash_time from %s.pg_active_session_history \
+ order by ash_time desc limit 2)";
+
 /*
  * pg_stat_statements query, a format string: %1$s is the quoted schema of
- * pg_stat_statements and %2$s that of pgsentinel.
+ * pg_stat_statements and %2$s is the query that selects relevant query IDs.
  */
 static const char * const pg_stat_statements_query=
 #if PG_VERSION_NUM < 130000
@@ -136,12 +163,7 @@ static const char * const pg_stat_statements_query=
  shared_blks_read, shared_blks_dirtied, shared_blks_written, local_blks_hit, \
  local_blks_read, local_blks_dirtied, local_blks_written, temp_blks_read, \
  temp_blks_written, blk_read_time, blk_write_time from %1$s.pg_stat_statements(false) \
- where queryid in  (select queryid from %2$s.pg_active_session_history  \
- where ash_time in (select ash_time from %2$s.pg_active_session_history  \
- order by ash_time desc limit 2) \
- union select nested_queryid from %2$s.pg_active_session_history \
- where ash_time in (select ash_time from %2$s.pg_active_session_history \
- order by ash_time desc limit 2))";
+ where queryid in (%2$s)";
 #elif PG_VERSION_NUM < 170000
 "select userid, dbid, queryid, calls, total_exec_time, rows, shared_blks_hit, \
  shared_blks_read, shared_blks_dirtied, shared_blks_written, local_blks_hit, \
@@ -149,12 +171,7 @@ static const char * const pg_stat_statements_query=
  temp_blks_written, blk_read_time, blk_write_time, \
  plans, total_plan_time, wal_records, wal_fpi, wal_bytes \
  from %1$s.pg_stat_statements(false) \
- where queryid in  (select queryid from %2$s.pg_active_session_history  \
- where ash_time in (select ash_time from %2$s.pg_active_session_history  \
- order by ash_time desc limit 2) \
- union select nested_queryid from %2$s.pg_active_session_history \
- where ash_time in (select ash_time from %2$s.pg_active_session_history \
- order by ash_time desc limit 2))";
+ where queryid in (%2$s)";
 #else
 "select userid, dbid, queryid, calls, total_exec_time, rows, shared_blks_hit, \
  shared_blks_read, shared_blks_dirtied, shared_blks_written, local_blks_hit, \
@@ -162,12 +179,7 @@ static const char * const pg_stat_statements_query=
  temp_blks_written, shared_blk_read_time, shared_blk_write_time, \
  plans, total_plan_time, wal_records, wal_fpi, wal_bytes \
  from %1$s.pg_stat_statements(false) \
- where queryid in  (select queryid from %2$s.pg_active_session_history  \
- where ash_time in (select ash_time from %2$s.pg_active_session_history  \
- order by ash_time desc limit 2) \
- union select nested_queryid from %2$s.pg_active_session_history \
- where ash_time in (select ash_time from %2$s.pg_active_session_history \
- order by ash_time desc limit 2))";
+ where queryid in (%2$s)";
 #endif
 
 /* quoted schema of the extension named $1 */
@@ -175,8 +187,15 @@ static const char * const extension_schema_query=
 "select quote_ident(n.nspname) from pg_extension e \
  join pg_namespace n on n.oid = e.extnamespace where e.extname = $1";
 
-static void pg_active_session_history_internal(FunctionCallInfo fcinfo);
+/* Return only the row descriptor of the active session history view. */
+static const char *const pg_active_session_history_desc_query =
+"select * from %s.pg_active_session_history limit 0";
+
+static void pg_active_session_history_internal(FunctionCallInfo fcinfo,
+											   pgashVersion api_version);
 static void pg_stat_statements_history_internal(FunctionCallInfo fcinfo);
+static pgashVersion pgash_api_version(int natts, pgashVersion api_version);
+static pgashVersion installed_pgash_api_version(const char *ash_schema);
 
 procEntry *ProcEntryArray = NULL;
 int proc_entry_count = 0;
@@ -1397,9 +1416,11 @@ pgsentinel_main(Datum main_arg)
 		bool gotactives;
 		bool collect_pgssh;
 		TimestampTz ash_time;
+		pgashVersion api_version = PGASH_V1_0;
 		const char *ash_schema;
 		const char *pgss_schema;
 		char *query;
+		char *queryids;
 		gotactives=false; 
 
 letswait:
@@ -1453,6 +1474,8 @@ letswait:
 			if (pgssh_enable)
 				pgss_schema = quoted_extension_schema("pg_stat_statements",
 													  pgsentinel_loop_context);
+			if (ash_schema != NULL && pgss_schema != NULL)
+				api_version = installed_pgash_api_version(ash_schema);
 		}
 
 		if (ash_schema == NULL) {
@@ -1489,7 +1512,15 @@ letswait:
 			SPI_connect();
 			PushActiveSnapshot(GetTransactionSnapshot());
 
-			query = psprintf(pg_stat_statements_query, pgss_schema, ash_schema);
+			if (api_version >= PGASH_V1_5)
+				queryids = psprintf(pg_stat_statements_queryids_v1_5,
+									ash_schema, ash_schema,
+									ash_schema, ash_schema);
+			else
+				queryids = psprintf(pg_stat_statements_queryids_v1_0,
+									ash_schema, ash_schema);
+
+			query = psprintf(pg_stat_statements_query, pgss_schema, queryids);
 			pgstat_report_activity(STATE_RUNNING, query);
 
 			/* We can now execute queries via SPI */
@@ -1688,7 +1719,8 @@ _PG_init(void)
 }
 
 static void
-pg_active_session_history_internal(FunctionCallInfo fcinfo)
+pg_active_session_history_internal(FunctionCallInfo fcinfo,
+								   pgashVersion api_version)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc       tupdesc;
@@ -1724,19 +1756,7 @@ pg_active_session_history_internal(FunctionCallInfo fcinfo)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
-	/*
-	 * The rows below are built for the current SQL definition.  After the
-	 * library is upgraded but before ALTER EXTENSION ... UPDATE, the installed
-	 * definition can still have the previous shape (1.4.1 lacks
-	 * nested_queryid); storing our values under it would read an int8 as a
-	 * text pointer and crash the server.
-	 */
-	if (tupdesc->natts != PG_ACTIVE_SESSION_HISTORY_COLS)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_active_session_history returns %d columns but the installed definition has %d",
-						PG_ACTIVE_SESSION_HISTORY_COLS, tupdesc->natts),
-				 errhint("Run ALTER EXTENSION pgsentinel UPDATE.")));
+	api_version = pgash_api_version(tupdesc->natts, api_version);
 
 	tupstore = tuplestore_begin_heap(true, false, work_mem);
 	rsinfo->returnMode = SFRM_Materialize;
@@ -1926,12 +1946,14 @@ pg_active_session_history_internal(FunctionCallInfo fcinfo)
 			nulls[j++] = true;
 		}
 
-		// nested_queryid - apply privilege check
-		if (show_text && AshEntryArray[i].nested_queryid)
-			values[j++] = Int64GetDatum(AshEntryArray[i].nested_queryid);
-		else
-			nulls[j++] = true;
-
+		if (api_version >= PGASH_V1_5)
+		{
+			/* Apply the privilege check to nested_queryid. */
+			if (show_text && AshEntryArray[i].nested_queryid)
+				values[j++] = Int64GetDatum(AshEntryArray[i].nested_queryid);
+			else
+				nulls[j++] = true;
+		}
 
 		// backend_type
 		if (AshEntryArray[i].backend_type[0] != '\0')
@@ -1956,6 +1978,10 @@ pg_active_session_history_internal(FunctionCallInfo fcinfo)
 			values[j++] = CStringGetTextDatum(AshEntryArray[i].blocker_state);
 		else
 			nulls[j++] = true;
+
+		Assert(j == (api_version == PGASH_V1_0 ?
+					 PG_ACTIVE_SESSION_HISTORY_COLS_V1_0 :
+					 PG_ACTIVE_SESSION_HISTORY_COLS_V1_5));
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
@@ -2194,7 +2220,21 @@ pg_stat_statements_history_internal(FunctionCallInfo fcinfo)
 Datum
 pg_active_session_history(PG_FUNCTION_ARGS)
 {
-	pg_active_session_history_internal(fcinfo);
+	/*
+	 * Versions 1.0 through 1.5.1 used this entry point. The tuple descriptor
+	 * distinguishes the two API shapes.
+	 */
+	pg_active_session_history_internal(fcinfo, PGASH_V1_0);
+	return (Datum) 0;
+}
+
+/*
+ * Return active session history using the version 1.5 SQL API.
+ */
+Datum
+pg_active_session_history_1_5(PG_FUNCTION_ARGS)
+{
+	pg_active_session_history_internal(fcinfo, PGASH_V1_5);
 	return (Datum) 0;
 }
 
@@ -2236,6 +2276,54 @@ PgSentinelHasBeenLoaded(void)
 	extensionLoaded = extensionPresent && extensionScriptExecuted;
 
 	return extensionLoaded;
+}
+
+/*
+ * Identify the active session history API and verify that a versioned entry
+ * point has the expected number of output columns.
+ */
+static pgashVersion
+pgash_api_version(int natts, pgashVersion api_version)
+{
+	switch (natts)
+	{
+		case PG_ACTIVE_SESSION_HISTORY_COLS_V1_0:
+			if (api_version != PGASH_V1_0)
+				elog(ERROR, "incorrect number of output arguments");
+			break;
+		case PG_ACTIVE_SESSION_HISTORY_COLS_V1_5:
+			/*
+			 * Versions 1.5.0 and 1.5.1 still used the legacy entry point,
+			 * so accept it and infer the API from the tuple descriptor.
+			 */
+			if (api_version != PGASH_V1_0 && api_version != PGASH_V1_5)
+				elog(ERROR, "incorrect number of output arguments");
+			api_version = PGASH_V1_5;
+			break;
+		default:
+			elog(ERROR, "incorrect number of output arguments");
+	}
+
+	return api_version;
+}
+
+/*
+ * Return the API version of the installed active session history view. The
+ * caller must be connected to SPI.
+ */
+static pgashVersion
+installed_pgash_api_version(const char *ash_schema)
+{
+	char	   *query;
+	int			ret;
+
+	query = psprintf(pg_active_session_history_desc_query, ash_schema);
+	ret = SPI_execute(query, true, 0);
+	if (ret != SPI_OK_SELECT || SPI_tuptable == NULL)
+		elog(ERROR, "cannot get pg_active_session_history row descriptor");
+
+	/* The legacy entry point supports both API shapes. */
+	return pgash_api_version(SPI_tuptable->tupdesc->natts, PGASH_V1_0);
 }
 
 /*
