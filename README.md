@@ -228,7 +228,7 @@ both. Sessions were held `active` with `pg_sleep()`; the figures are each
 worker's own CPU time from `/proc/<pid>/schedstat` over 60 seconds, divided by
 the samples it took, and every sample of both recorded all the sessions.
 
-| Active sessions | SPI/SQL sampler | Direct calls | Ratio |
+| Active sessions | SPI/SQL sampler, CPU per sample | Direct calls, CPU per sample | Ratio |
 |---:|---:|---:|---:|
 | 25  | 2.23 ms  | 0.32 ms | 7x  |
 | 50  | 3.58 ms  | 0.38 ms | 9x  |
@@ -236,19 +236,24 @@ the samples it took, and every sample of both recorded all the sessions.
 | 200 | 21.77 ms | 0.60 ms | 36x |
 
 The ratio widens with concurrency because the two samplers scale differently:
-going from 100 to 200 sessions multiplies the SQL sampler's cost by 2.9 (it
-self-joins `pg_stat_activity` and calls `pg_blocking_pids()` twice per row),
-and the direct path's by 1.2, as most of what it still spends is per sample
-rather than per session.
+going from 100 to 200 sessions multiplies the SQL sampler's cost by 2.9, and
+the direct path's by 1.2, as most of what it still spends is per sample rather
+than per session. The SQL query self-joins `pg_stat_activity` on
+`pg_blocking_pids()`, and its plan evaluates that in a nested loop's join
+filter, once for every pair of sampled session and backend: counted with a
+uprobe, one execution with 200 sampled sessions and 207 backends made 41,800
+calls, 200 × 207 plus two per row.
 
 Two further choices keep the direct path's cost down. Each cycle the worker
 looks up its schema with a catalog query; it keeps the plan of that query
 rather than parsing and planning it again, and runs it only when
 `pg_stat_statements_history` needs the schema. And it skips
-`pg_blocking_pids()` for sessions that can't be blocked. Each call takes
-`ProcArrayLock` and all 16 lock manager partition locks, which other backends
-need to acquire and release heavyweight locks, so asking only where an answer
-is possible also stays out of the workload's way.
+`pg_blocking_pids()` for sessions that can't be blocked. According to
+`lock.c` in PostgreSQL 10 through 19, each call takes `ProcArrayLock` and all
+16 lock manager partition locks in shared mode, which holds off backends that
+need one of them exclusively to acquire or release a heavyweight lock outside
+the fast path, so asking only where an answer is possible also stays out of
+the workload's way.
 
 In absolute terms the sampler is cheap either way at the default one second
 period: 21.77 ms per second is about 2% of a single core. The difference
