@@ -16,3 +16,14 @@ step h1_commit: COMMIT;
 step h2_commit: COMMIT;
 step w_excl: <... completed>
 step w_commit: COMMIT;
+
+starting permutation: h1_other w_par o_par h1_commit
+step h1_other: BEGIN; LOCK TABLE ash_lock_other IN ACCESS EXCLUSIVE MODE;
+step w_par: 
+    DO $$ BEGIN PERFORM set_config(CASE WHEN current_setting('server_version_num')::int >= 160000
+        THEN 'debug_parallel_query' ELSE 'force_parallel_mode' END, 'on', true); END $$;
+    CREATE TABLE ash_par_out AS SELECT ash_read_other() AS n;
+ <waiting ...>
+step o_par: DO $$ BEGIN PERFORM ash_check_leader_blocked(); END $$;
+step h1_commit: COMMIT;
+step w_par: <... completed>

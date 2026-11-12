@@ -1101,6 +1101,8 @@ ash_collect_sample(TimestampTz ash_time, bool track_idle, bool *gotactives)
 	TupleTableSlot *slot;
 	int				my_pid = MyProcPid;
 	ashActivityRow *rows;
+	int			   *lock_groups;
+	int				nlock_groups = 0;
 	int				nrows = 0;
 	int				maxrows = 64;
 	int				r;
@@ -1282,6 +1284,19 @@ ash_collect_sample(TimestampTz ash_time, bool track_idle, bool *gotactives)
 		}
 	}
 
+	/*
+	 * pg_blocking_pids() reports on a session's whole lock group (a parallel
+	 * leader and its workers) and finds nothing unless some member waits on a
+	 * heavyweight lock.  Note which groups have such a member, so the call is
+	 * made only where it can return something.  Without leader_pid (before
+	 * PostgreSQL 13) groups are unknown, and every session is asked.
+	 */
+	lock_groups = (int *) palloc(sizeof(int) * Max(nrows, 1));
+	for (r = 0; r < nrows; r++)
+		if (strcmp(rows[r].wait_event_type, "Lock") == 0)
+			lock_groups[nlock_groups++] =
+				rows[r].leader_pid ? rows[r].leader_pid : rows[r].pid;
+
 	/* Pass 2: keep the sessions the old WHERE clause would have kept. */
 	for (r = 0; r < nrows; r++)
 	{
@@ -1306,7 +1321,21 @@ ash_collect_sample(TimestampTz ash_time, bool track_idle, bool *gotactives)
 		if (!wanted)
 			continue;
 
-		ash_get_blockers(row->pid, &blocker_pid, &blocker_count);
+		blocker_pid = blocker_count = 0;
+		if (a_leader_pid <= 0)
+			ash_get_blockers(row->pid, &blocker_pid, &blocker_count);
+		else
+		{
+			int			group = row->leader_pid ? row->leader_pid : row->pid;
+			int			g;
+
+			for (g = 0; g < nlock_groups; g++)
+				if (lock_groups[g] == group)
+				{
+					ash_get_blockers(row->pid, &blocker_pid, &blocker_count);
+					break;
+				}
+		}
 		blocker_state = ash_state_of_pid(rows, nrows, blocker_pid);
 
 		pe = ash_proc_entry_of_pid(row->pid);
@@ -1468,8 +1497,15 @@ letswait:
 
 		if (PgSentinelHasBeenLoaded())
 		{
-			ash_schema = quoted_extension_schema(EXTENSION_NAME,
-												 pgsentinel_loop_context);
+			/*
+			 * Only the pg_stat_statements history queries need our schema:
+			 * the sampler calls functions instead of naming our objects.
+			 * Without pgssh, ash_schema just records that the extension
+			 * exists, which PgSentinelHasBeenLoaded() has checked.
+			 */
+			ash_schema = pgssh_enable
+				? quoted_extension_schema(EXTENSION_NAME, pgsentinel_loop_context)
+				: "";
 			/* Look it up now, so pgssh collection is skipped without it */
 			if (pgssh_enable)
 				pgss_schema = quoted_extension_schema("pg_stat_statements",
@@ -2364,9 +2400,23 @@ quoted_extension_schema(const char *extname, MemoryContext mcxt)
 	Oid			argtypes[1] = {TEXTOID};
 	Datum		values[1];
 
+	static SPIPlanPtr plan = NULL;
+
+	/*
+	 * This runs every cycle, and parsing and planning the query cost more
+	 * than running it, so keep the plan.  The worker's search_path is fixed,
+	 * and the plan cache revalidates it after catalog changes.
+	 */
 	values[0] = CStringGetTextDatum(extname);
-	if (SPI_execute_with_args(extension_schema_query, 1, argtypes, values,
-							  NULL, true, 1) != SPI_OK_SELECT)
+	if (plan == NULL)
+	{
+		SPIPlanPtr	p = SPI_prepare(extension_schema_query, 1, argtypes);
+
+		if (p == NULL || SPI_keepplan(p) != 0)
+			elog(FATAL, "cannot prepare the extension schema query");
+		plan = p;
+	}
+	if (SPI_execute_plan(plan, values, NULL, true, 1) != SPI_OK_SELECT)
 		elog(FATAL, "cannot look up the schema of extension \"%s\"", extname);
 
 	if (SPI_processed == 0)

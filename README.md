@@ -131,8 +131,9 @@ exits non-zero if anything fails, so the command can run unattended:
    definitions of the view until `ALTER EXTENSION pgsentinel_nx UPDATE`, and
    objects built on the view survive the update;
  * `pgsentinel-blockers` (isolation test): `blockers`, `blockerpid` and
-   `blocker_state` checked against `pg_blocking_pids()` for a row lock wait and
-   for a table lock held by two sessions, along with the waiter's other columns;
+   `blocker_state` checked against `pg_blocking_pids()` for a row lock wait,
+   for a table lock held by two sessions, and for a parallel query whose worker
+   waits on a lock, along with the waiter's other columns;
  * `pgsentinel-disabled-test`: sampling with `pgsentinel_nx_pgssh.enable = off`.
 
 A failure leaves its differences in `regression.diffs` and
@@ -206,8 +207,9 @@ sample while still relying only on PostgreSQL's own documented functions: the
 extension consumes the rows `pg_stat_get_activity()` returns and the array of
 blocking pids `pg_blocking_pids()` returns, and builds the blocker resolution
 around those results instead of duplicating any core algorithm inside the
-extension. Blockers are resolved with a single `pg_blocking_pids()` call per
-sampled backend.
+extension. `pg_blocking_pids()` reports on a session's whole lock group (a
+parallel leader and its workers) and finds nothing unless some member waits on
+a heavyweight lock, so it is called only for the sessions of such groups.
 
 Switching to the direct calls did not change the columns of
 `pg_active_session_history` or the extension's configuration. One value
@@ -219,28 +221,40 @@ With `compute_query_id = on` — the setting that makes `queryid` joinable to
 
 #### Sampling overhead
 
-Cost of one sample, measured on PostgreSQL 18.4 (8 cores) against the previous
-SPI/SQL sampler. Sessions were held `active` with `pg_sleep()` so that the
-sampler had to describe all of them while they consumed no CPU themselves; the
-figures are the bgworker's own CPU time over a 90 second window, and were
-cross-checked by timing the old SQL statement directly.
+Cost of one sample, measured on PostgreSQL 16.15 with 4 vCPUs. Vanilla
+pgsentinel 1.5.2 and this build ran in the same server at the same time, so
+both described the same sessions, with `pg_stat_statements_history` off for
+both. Sessions were held `active` with `pg_sleep()`; the figures are each
+worker's own CPU time from `/proc/<pid>/schedstat` over 60 seconds, divided by
+the samples it took, and every sample of both recorded all the sessions.
 
 | Active sessions | SPI/SQL sampler | Direct calls | Ratio |
 |---:|---:|---:|---:|
-| 25  | 1.7 ms  | 0.1 ms | 17x |
-| 50  | 3.6 ms  | 0.2 ms | 18x |
-| 100 | 6.1 ms  | 0.3 ms | 20x |
-| 200 | 20.8 ms | 0.6 ms | 35x |
+| 25  | 2.23 ms  | 0.32 ms | 7x  |
+| 50  | 3.58 ms  | 0.38 ms | 9x  |
+| 100 | 7.49 ms  | 0.50 ms | 15x |
+| 200 | 21.77 ms | 0.60 ms | 36x |
 
 The ratio widens with concurrency because the two samplers scale differently:
-doubling the sessions from 100 to 200 multiplies the SQL sampler's cost by 3.4
-(it self-joins `pg_stat_activity` and calls `pg_blocking_pids()` twice per row),
-while the direct path grows by exactly 2.
+going from 100 to 200 sessions multiplies the SQL sampler's cost by 2.9 (it
+self-joins `pg_stat_activity` and calls `pg_blocking_pids()` twice per row),
+and the direct path's by 1.2, as most of what it still spends is per sample
+rather than per session.
+
+Two further choices keep the direct path's cost down. Each cycle the worker
+looks up its schema with a catalog query; it keeps the plan of that query
+rather than parsing and planning it again, and runs it only when
+`pg_stat_statements_history` needs the schema. And it skips
+`pg_blocking_pids()` for sessions that can't be blocked. Each call takes
+`ProcArrayLock` and all 16 lock manager partition locks, which other backends
+need to acquire and release heavyweight locks, so asking only where an answer
+is possible also stays out of the workload's way.
 
 In absolute terms the sampler is cheap either way at the default one second
-period — 20.8 ms per second is 2% of a single core. The difference matters on
-instances with many active sessions, on machines that are already CPU bound, or
-where the periodic planner work of the old statement was itself the problem.
+period: 21.77 ms per second is about 2% of a single core. The difference
+matters on instances with many active sessions, on machines that are already
+CPU bound, or where the periodic planner work of the old statement was itself
+the problem.
 
 [^1]: When `pg_stat_activity.query_id` is not available — before PostgreSQL 14, or with `compute_query_id = off` — `queryid` falls back to the id from `get_parsedinfo()` and therefore matches `nested_queryid`.
 
